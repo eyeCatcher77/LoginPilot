@@ -2,7 +2,7 @@
 
 **Proxy, VPN & RDP Manager for Windows**
 
-Lightweight Windows tray tool for automatic proxy switching, VPN launch and RDP session management. Designed for office/home office environments with Microsoft infrastructure. Portable, no installation required, config via XML. Reducing Clicks and complexity for login Attempts.
+Lightweight Windows tray tool for automatic proxy switching, VPN launch and RDP session management. Designed for office/home office environments with Microsoft infrastructure. Portable, no installation required, config via XML. The easiest way to connect to your RDP Servers.
 
 ---
 
@@ -117,7 +117,6 @@ LoginPilot is designed with a minimal attack surface:
 - No external DLLs – single file executable
 - Proxy settings written to HKCU only (user scope, not system-wide)
 
-
 ---
 
 ## File Structure
@@ -135,4 +134,6 @@ version.txt                        ← Current version number (e.g. 3.2)
 
 ## License
 
-Internal tool. No warranty. Use at your own risk.
+MIT License – see [LICENSE](LICENSE) for details.
+
+Copyright (c) 2026 Stefan Diller
