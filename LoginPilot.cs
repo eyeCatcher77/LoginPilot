@@ -1,5 +1,7 @@
 // ============================================
-// LoginPilot v3.2 - Proxy, VPN & Arbeitsplatz Manager
+// LoginPilot v3.3 - Proxy, VPN & Arbeitsplatz Manager
+// v3.3: WinHTTP-Proxy wird jetzt synchron mit User-Proxy gesetzt/zurueckgesetzt
+//       (Fix fuer Microsoft Store / winget / Windows Update Downloads im HomeOffice)
 //
 // Portabel: Config liegt neben der EXE
 // Erststart: Oeffnet automatisch Einstellungen wenn keine Config
@@ -124,6 +126,7 @@ namespace LoginPilot
 
         public static void Enable(ProxyProfile p)
         {
+            // 1. User-Proxy (HKCU) fuer Browser/IE/Edge
             using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Internet Settings", true))
             {
                 k.SetValue("ProxyEnable", 1, RegistryValueKind.DWord);
@@ -131,13 +134,76 @@ namespace LoginPilot
                 k.SetValue("ProxyOverride", p.Exceptions, RegistryValueKind.String);
             }
             Refresh();
+
+            // 2. WinHTTP-Proxy (systemweit) fuer Store/winget/Windows Update
+            SetWinHttpProxy(p.ProxyAddress, p.Exceptions);
         }
 
         public static void Disable()
         {
+            // 1. User-Proxy aus
             using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Internet Settings", true))
             { k.SetValue("ProxyEnable", 0, RegistryValueKind.DWord); }
             Refresh();
+
+            // 2. WinHTTP-Proxy zuruecksetzen (sonst haengen Store/winget zuhause!)
+            ResetWinHttpProxy();
+        }
+
+        // === v3.3: WinHTTP-Proxy via netsh setzen ===
+        static void SetWinHttpProxy(string proxyAddress, string exceptions)
+        {
+            try
+            {
+                string bypass = string.IsNullOrEmpty(exceptions) ? "<local>" : exceptions;
+                string args = "winhttp set proxy proxy-server=\"" + proxyAddress + "\" bypass-list=\"" + bypass + "\"";
+                RunNetsh(args);
+            }
+            catch { /* silent - WinHTTP-Set nicht kritisch */ }
+        }
+
+        // === v3.3: WinHTTP-Proxy via netsh zuruecksetzen ===
+        static void ResetWinHttpProxy()
+        {
+            try { RunNetsh("winhttp reset proxy"); }
+            catch { /* silent */ }
+        }
+
+        // === v3.3: Self-Healing - WinHTTP an User-Proxy angleichen ===
+        // Wird beim Start aufgerufen, um Altlasten (alte WinHTTP-Proxys von v3.2 oder
+        // dem ABRE-Setup-Skript) automatisch zu bereinigen.
+        public static void SyncWinHttpWithUserProxy()
+        {
+            try
+            {
+                if (IsEnabled())
+                {
+                    // User-Proxy ist EIN -> WinHTTP auf gleiche Werte setzen
+                    SetWinHttpProxy(GetServer(), GetExceptions());
+                }
+                else
+                {
+                    // User-Proxy ist AUS -> WinHTTP auch zuruecksetzen
+                    ResetWinHttpProxy();
+                }
+            }
+            catch { /* silent */ }
+        }
+
+        static void RunNetsh(string arguments)
+        {
+            var psi = new ProcessStartInfo("netsh.exe", arguments)
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            using (var proc = Process.Start(psi))
+            {
+                proc.WaitForExit(5000);
+            }
         }
 
         public static bool IsEnabled()
@@ -311,7 +377,7 @@ namespace LoginPilot
     // ========== AUTO-UPDATE ==========
     public static class AutoUpdater
     {
-        const string CurrentVersion    = "3.2";
+        const string CurrentVersion    = "3.3";
         const string VersionUrl        = "https://raw.githubusercontent.com/eyeCatcher77/LoginPilot/main/version.txt";
         const string ExeUrl            = "https://raw.githubusercontent.com/eyeCatcher77/LoginPilot/main/LoginPilot.exe";
         const int    TimeoutMs         = 5000; // Kein langer Haenger beim Start
@@ -650,6 +716,9 @@ namespace LoginPilot
             if (_cfg.DarkTheme) Clr.SetDark(); else Clr.SetLight();
             try { string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "loginpilot_icon.ico"); if (File.Exists(p)) _appIcon = new Icon(p); } catch { }
 
+            // v3.3: Self-Healing - alten WinHTTP-Proxy bereinigen falls noch von v3.2 oder ABRE-Setup vorhanden
+            ProxyManager.SyncWinHttpWithUserProxy();
+
             InitForm(); InitTray(); BuildMainPage(); BuildConfigPage(); LoadLogo(); UpdateMainLayout();
             InitNetworkWatcher();
 
@@ -919,7 +988,7 @@ namespace LoginPilot
             };
             _mainPage.Controls.Add(btnTheme);
 
-            var ver = AL("v3.1", new Font("Segoe UI", 7.5f), Clr.Brd, CW, 800);
+            var ver = AL("v3.3", new Font("Segoe UI", 7.5f), Clr.Brd, CW, 800);
             ver.Tag = "version";
             _mainPage.Controls.Add(ver);
         }
@@ -1166,38 +1235,26 @@ namespace LoginPilot
                     {
                         if (!guiRunning)
                         {
-                            // GUI erst starten, dann connect-Befehl verz\u00f6gert senden
+                            // GUI erst starten
                             var psi = new System.Diagnostics.ProcessStartInfo();
                             psi.FileName = _cfg.VpnCommand;
                             psi.UseShellExecute = true;
                             System.Diagnostics.Process.Start(psi);
 
-                            // Kurz warten bis GUI bereit ist, dann connect senden
+                            // Laenger warten bis GUI bereit ist (3.5s), dann connect senden
                             var connectTimer = new Timer();
-                            connectTimer.Interval = 2000;
+                            connectTimer.Interval = 3500;
                             connectTimer.Tick += (ct, ce) =>
                             {
                                 connectTimer.Stop(); connectTimer.Dispose();
-                                try
-                                {
-                                    var psi2 = new System.Diagnostics.ProcessStartInfo();
-                                    psi2.FileName = _cfg.VpnCommand;
-                                    psi2.Arguments = _cfg.VpnArgs;
-                                    psi2.UseShellExecute = true;
-                                    System.Diagnostics.Process.Start(psi2);
-                                }
-                                catch { }
+                                SendVpnConnect();
                             };
                             connectTimer.Start();
                         }
                         else
                         {
-                            // GUI l\u00e4uft schon -> direkt connect senden
-                            var psi = new System.Diagnostics.ProcessStartInfo();
-                            psi.FileName = _cfg.VpnCommand;
-                            psi.Arguments = _cfg.VpnArgs;
-                            psi.UseShellExecute = true;
-                            System.Diagnostics.Process.Start(psi);
+                            // GUI laeuft schon -> direkt connect senden
+                            SendVpnConnect();
                         }
                     }
                     catch { }
@@ -1210,10 +1267,16 @@ namespace LoginPilot
                     _btnWts.BgNormal = Clr.RedD; _btnWts.BgHover = Clr.RedHi;
                     _btnWts.Invalidate();
 
-                    // Fokus zurueckholen nach OpenVPN-GUI Start
+                    // Fokus zurueckholen nach OpenVPN-GUI Start (mehrere Versuche)
+                    int focusAttempts = 0;
                     var focusTimer = new Timer();
-                    focusTimer.Interval = 500;
-                    focusTimer.Tick += (ft, fe) => { focusTimer.Stop(); focusTimer.Dispose(); Activate(); };
+                    focusTimer.Interval = 800;
+                    focusTimer.Tick += (ft, fe) =>
+                    {
+                        focusAttempts++;
+                        if (focusAttempts >= 5) { focusTimer.Stop(); focusTimer.Dispose(); return; }
+                        try { Activate(); BringToFront(); } catch { }
+                    };
                     focusTimer.Start();
 
                     var vpnTimer = new Timer();
@@ -1234,7 +1297,7 @@ namespace LoginPilot
                         ResetWtsButton();
                         _lblWtsInfo.ForeColor = Clr.T2;
                         _lblWtsInfo.Text = "VPN-Verbindung abgebrochen";
-                        Activate(); Focus();
+                        Activate(); BringToFront(); Focus();
                     };
 
                     // Original Click-Handler tempor\u00e4r ersetzen
@@ -1279,6 +1342,85 @@ namespace LoginPilot
 
             // Fallback: Kein VPN konfiguriert oder VPN deaktiviert -> direkt RDP
             DoLaunchRdp(rdpFile, found);
+        }
+
+        [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hWnd);
+
+        void BringOpenVpnToFront()
+        {
+            try
+            {
+                string exeName = Path.GetFileNameWithoutExtension(_cfg.VpnCommand);
+                var procs = System.Diagnostics.Process.GetProcessesByName(exeName);
+                foreach (var p in procs)
+                {
+                    if (p.MainWindowHandle != IntPtr.Zero)
+                    {
+                        if (IsIconic(p.MainWindowHandle))
+                            ShowWindow(p.MainWindowHandle, 9); // SW_RESTORE
+                        SetForegroundWindow(p.MainWindowHandle);
+                    }
+                    p.Dispose();
+                }
+            }
+            catch { }
+        }
+
+        void SendVpnConnect()
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo();
+                psi.FileName = _cfg.VpnCommand;
+                psi.Arguments = _cfg.VpnArgs;
+                psi.UseShellExecute = true;
+                System.Diagnostics.Process.Start(psi);
+
+                // Nach 1.5s OpenVPN-Fenster in den Vordergrund bringen (PIN-Eingabe)
+                var bringToFrontTimer = new Timer();
+                bringToFrontTimer.Interval = 1500;
+                int attempts = 0;
+                bringToFrontTimer.Tick += (bt, be) =>
+                {
+                    attempts++;
+                    BringOpenVpnToFront();
+                    if (attempts >= 3)
+                    {
+                        bringToFrontTimer.Stop(); bringToFrontTimer.Dispose();
+                    }
+                };
+                bringToFrontTimer.Start();
+
+                // Retry nach 4s falls GUI den Connect-Befehl verschluckt hat
+                var retryTimer = new Timer();
+                retryTimer.Interval = 4000;
+                retryTimer.Tick += (rt, re) =>
+                {
+                    retryTimer.Stop(); retryTimer.Dispose();
+                    if (!NetDetect.IsVpnConnected())
+                    {
+                        try
+                        {
+                            var psi2 = new System.Diagnostics.ProcessStartInfo();
+                            psi2.FileName = _cfg.VpnCommand;
+                            psi2.Arguments = _cfg.VpnArgs;
+                            psi2.UseShellExecute = true;
+                            System.Diagnostics.Process.Start(psi2);
+
+                            // Nochmal Fenster in den Vordergrund
+                            var retry2 = new Timer();
+                            retry2.Interval = 1500;
+                            retry2.Tick += (r2t, r2e) => { retry2.Stop(); retry2.Dispose(); BringOpenVpnToFront(); };
+                            retry2.Start();
+                        }
+                        catch { }
+                    }
+                };
+                retryTimer.Start();
+            }
+            catch { }
         }
 
         void StartTunnelCheck(string rdpFile, string foundPath)
