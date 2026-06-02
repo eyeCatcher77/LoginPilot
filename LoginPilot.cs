@@ -1182,6 +1182,7 @@ namespace LoginPilot
             string rdpFile = GetCurrentRdpFile();
             if (string.IsNullOrEmpty(rdpFile))
             {
+                _rdpLaunchInProgress = false;
                 MessageBox.Show("Keine RDP-Datei konfiguriert f\u00fcr den aktuellen Modus.", "Arbeitsplatz", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
@@ -1189,6 +1190,7 @@ namespace LoginPilot
             string found = RdpLauncher.FindRdp(rdpFile);
             if (found == null)
             {
+                _rdpLaunchInProgress = false;
                 MessageBox.Show("RDP-Datei nicht gefunden:\n" + rdpFile + "\n\nBitte in C:\\ZEUS\\ ablegen oder vollst\u00e4ndigen Pfad in den Einstellungen angeben.",
                     "Arbeitsplatz", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
@@ -1289,7 +1291,9 @@ namespace LoginPilot
                     EventHandler cancelHandler = null;
                     cancelHandler = (cs, ce) =>
                     {
-                        _rdpLaunchInProgress = false; // FIX: Guard zurücksetzen bei Abbruch
+                        _rdpLaunchInProgress = false;
+                        _vpnWaitActive = false;
+                        _activeCancelHandler = null;
                         cancelled = true;
                         vpnTimer.Stop(); vpnTimer.Dispose();
                         _btnWts.Click -= cancelHandler;
@@ -1303,6 +1307,8 @@ namespace LoginPilot
                     // Original Click-Handler tempor\u00e4r ersetzen
                     _btnWts.Click -= _wtsClickHandler;
                     _btnWts.Click += cancelHandler;
+                    _vpnWaitActive = true;
+                    _activeCancelHandler = cancelHandler;
 
                     vpnTimer.Tick += (ts, te) =>
                     {
@@ -1311,6 +1317,8 @@ namespace LoginPilot
                         if (NetDetect.IsVpnConnected())
                         {
                             vpnTimer.Stop(); vpnTimer.Dispose();
+                            _vpnWaitActive = false;
+                            _activeCancelHandler = null;
                             _btnWts.Click -= cancelHandler;
                             _btnWts.Click += _wtsClickHandler;
                             _lblWtsInfo.ForeColor = Clr.Org;
@@ -1324,6 +1332,8 @@ namespace LoginPilot
                         else if (elapsed >= maxWait)
                         {
                             vpnTimer.Stop(); vpnTimer.Dispose();
+                            _vpnWaitActive = false;
+                            _activeCancelHandler = null;
                             _btnWts.Click -= cancelHandler;
                             _btnWts.Click += _wtsClickHandler;
                             ResetWtsButton();
@@ -1866,10 +1876,35 @@ namespace LoginPilot
         {
             if (e.Mode == PowerModes.Resume)
             {
-                // Nach Resume etwas warten bis Netzwerk steht
-                if (InvokeRequired) { try { Invoke(new Action(() => ScheduleNetworkRecheck(5000))); } catch { } return; }
-                ScheduleNetworkRecheck(5000);
+                if (InvokeRequired) { try { Invoke(new Action(() => HandleResume())); } catch { } return; }
+                HandleResume();
             }
+        }
+
+        bool _vpnWaitActive = false;
+        EventHandler _activeCancelHandler = null;
+
+        void HandleResume()
+        {
+            // Hard-Reset: Button-State komplett zuruecksetzen
+            _wtsConnected = false;
+            _rdpLaunchInProgress = false;
+
+            // Falls ein Cancel-Handler aktiv ist, diesen entfernen und Original wiederherstellen
+            if (_vpnWaitActive && _activeCancelHandler != null)
+            {
+                try { _btnWts.Click -= _activeCancelHandler; } catch { }
+                try { _btnWts.Click += _wtsClickHandler; } catch { }
+                _activeCancelHandler = null;
+            }
+            _vpnWaitActive = false;
+            ResetWtsButton();
+
+            // Netzwerk-Hash zuruecksetzen damit DoNetworkRecheck auf jeden Fall durchlaeuft
+            _lastNetworkHash = "";
+
+            // Nach Resume warten bis Netzwerk steht, dann Neuerkennung
+            ScheduleNetworkRecheck(5000);
         }
 
         void ScheduleNetworkRecheck(int delayMs = 2000)
