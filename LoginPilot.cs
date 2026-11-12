@@ -955,7 +955,7 @@ namespace LoginPilot
                 Font = new Font("Segoe UI", 10f, FontStyle.Bold)
             };
             _btnWts.SetTooltip("Passende RDP-Verbindung starten");
-            _wtsClickHandler = (sn, ev) => LaunchWts();
+            _wtsClickHandler = (sn, ev) => OnWtsButtonClick();
             _btnWts.Click += _wtsClickHandler;
             _mainPage.Controls.Add(_btnWts);
 
@@ -1171,18 +1171,101 @@ namespace LoginPilot
             return null;
         }
 
+        // ---------- Verbindungsvorgang: zentrale Verwaltung ----------
+        // Alle Timer eines Verbindungsvorgangs werden hier registriert, damit
+        // Abbrechen, Timeout und Resume sie garantiert gemeinsam stoppen.
+        readonly List<Timer> _launchTimers = new List<Timer>();
+        int _launchGen = 0;          // wird bei jedem Start/Ende erhoeht -> Ticks alter Vorgaenge werden ignoriert
+        bool _vpnWaitActive = false; // true solange auf VPN/2FA gewartet wird (Button zeigt ABBRECHEN)
+
+        Timer NewLaunchTimer(int intervalMs)
+        {
+            var t = new Timer();
+            t.Interval = intervalMs;
+            _launchTimers.Add(t);
+            return t;
+        }
+
+        void StopLaunchTimer(Timer t)
+        {
+            try { t.Stop(); t.Dispose(); } catch { }
+            _launchTimers.Remove(t);
+        }
+
+        void StopAllLaunchTimers()
+        {
+            foreach (var t in _launchTimers.ToArray()) { try { t.Stop(); t.Dispose(); } catch { } }
+            _launchTimers.Clear();
+        }
+
+        // Beendet einen laufenden Verbindungsvorgang vollstaendig (Abbruch, Timeout, Fehler, Resume).
+        // info == null -> Standard-Infotext anzeigen. notify -> Tray-Hinweis, falls Fenster versteckt.
+        void EndLaunch(string info, Color infoColor, bool notify)
+        {
+            _launchGen++;
+            StopAllLaunchTimers();
+            _rdpLaunchInProgress = false;
+            _vpnWaitActive = false;
+            ResetWtsButton();
+            if (info == null) { UpdateWtsInfo(); return; }
+            _lblWtsInfo.ForeColor = infoColor;
+            _lblWtsInfo.Text = info;
+            if (notify) NotifyTray(info);
+        }
+
+        // Rueckmeldung per Tray-Sprechblase, wenn das Hauptfenster nicht sichtbar ist
+        void NotifyTray(string text)
+        {
+            try
+            {
+                if (Visible && WindowState != FormWindowState.Minimized) return;
+                _tray.ShowBalloonTip(6000, "LoginPilot", text, ToolTipIcon.Warning);
+            }
+            catch { }
+        }
+
+        void ShowMainWindow()
+        {
+            Show(); ShowInTaskbar = true; WindowState = FormWindowState.Normal; BringToFront(); Activate();
+        }
+
+        // Klick auf den Arbeitsplatz-Button: waehrend der VPN-Wartezeit = Abbrechen, sonst Starten
+        void OnWtsButtonClick()
+        {
+            if (_vpnWaitActive)
+            {
+                EndLaunch("VPN-Verbindung abgebrochen", Clr.T2, false);
+                return;
+            }
+            LaunchWts();
+        }
+
+        void SetWtsBusy(string buttonText, string info)
+        {
+            _lblWtsInfo.ForeColor = Clr.Org;
+            _lblWtsInfo.Text = info;
+            _btnWts.Enabled = false;
+            _btnWts.Text = buttonText;
+            _btnWts.BgNormal = Clr.OrgD; _btnWts.BgHover = Clr.OrgHi;
+            _btnWts.Invalidate();
+        }
+
         void LaunchWts()
         {
             if (!_cfg.EnableRdp) return;
-            if (_rdpLaunchInProgress) return; // FIX: Doppelstart verhindern
-            _rdpLaunchInProgress = true;      // FIX: Verbindungsvorgang markieren
+            // Laeuft bereits ein Vorgang (z.B. Start aus dem Tray): Fenster mit Status zeigen statt still nichts zu tun
+            if (_rdpLaunchInProgress) { ShowMainWindow(); return; }
+
+            _rdpLaunchInProgress = true;
             _wtsConnected = false; // Bei jedem Klick zuruecksetzen
+            int gen = ++_launchGen;
+            StopAllLaunchTimers();
             ResetWtsButton();
 
             string rdpFile = GetCurrentRdpFile();
             if (string.IsNullOrEmpty(rdpFile))
             {
-                _rdpLaunchInProgress = false;
+                EndLaunch(null, Clr.T2, false);
                 MessageBox.Show("Keine RDP-Datei konfiguriert f\u00fcr den aktuellen Modus.", "Arbeitsplatz", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
@@ -1190,7 +1273,7 @@ namespace LoginPilot
             string found = RdpLauncher.FindRdp(rdpFile);
             if (found == null)
             {
-                _rdpLaunchInProgress = false;
+                EndLaunch(null, Clr.T2, false);
                 MessageBox.Show("RDP-Datei nicht gefunden:\n" + rdpFile + "\n\nBitte in C:\\ZEUS\\ ablegen oder vollst\u00e4ndigen Pfad in den Einstellungen angeben.",
                     "Arbeitsplatz", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
@@ -1206,146 +1289,25 @@ namespace LoginPilot
             // HomeOffice: VPN pruefen
             if (_cfg.EnableVpn)
             {
-                bool vpnUp = NetDetect.IsVpnConnected();
-
-                if (vpnUp)
+                if (NetDetect.IsVpnConnected())
                 {
                     // VPN steht bereits -> Tunnel-Check, dann RDP
-                    _lblWtsInfo.ForeColor = Clr.Org;
-                    _lblWtsInfo.Text = "\u23f3 VPN verbunden \u2013 pr\u00fcfe Tunnel...";
-                    _btnWts.Enabled = false;
-                    _btnWts.Text = "\u23f3  PR\u00dcFE TUNNEL...";
-                    StartTunnelCheck(rdpFile, found);
+                    SetWtsBusy("\u23f3  PR\u00dcFE TUNNEL...", "\u23f3 VPN verbunden \u2013 pr\u00fcfe Tunnel...");
+                    StartTunnelCheck(rdpFile, found, gen);
                     return;
                 }
 
                 // VPN nicht verbunden -> VPN starten
-                if (!string.IsNullOrEmpty(_cfg.VpnCommand) && File.Exists(_cfg.VpnCommand))
+                if (!string.IsNullOrEmpty(_cfg.VpnCommand))
                 {
-                    // Pruefen ob OpenVPN-GUI bereits laeuft
-                    bool guiRunning = false;
-                    try
+                    if (!File.Exists(_cfg.VpnCommand))
                     {
-                        string exeName = Path.GetFileNameWithoutExtension(_cfg.VpnCommand);
-                        var procs = System.Diagnostics.Process.GetProcessesByName(exeName);
-                        guiRunning = procs.Length > 0;
-                        foreach (var pr in procs) pr.Dispose();
+                        EndLaunch("\u26a0 VPN-Programm nicht gefunden", Clr.Red, false);
+                        MessageBox.Show("Das VPN-Programm wurde nicht gefunden:\n" + _cfg.VpnCommand + "\n\nBitte den Pfad in den Einstellungen pr\u00fcfen.",
+                            "Arbeitsplatz", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
                     }
-                    catch { }
-
-                    try
-                    {
-                        if (!guiRunning)
-                        {
-                            // GUI erst starten
-                            var psi = new System.Diagnostics.ProcessStartInfo();
-                            psi.FileName = _cfg.VpnCommand;
-                            psi.UseShellExecute = true;
-                            System.Diagnostics.Process.Start(psi);
-
-                            // Laenger warten bis GUI bereit ist (3.5s), dann connect senden
-                            var connectTimer = new Timer();
-                            connectTimer.Interval = 3500;
-                            connectTimer.Tick += (ct, ce) =>
-                            {
-                                connectTimer.Stop(); connectTimer.Dispose();
-                                SendVpnConnect();
-                            };
-                            connectTimer.Start();
-                        }
-                        else
-                        {
-                            // GUI laeuft schon -> direkt connect senden
-                            SendVpnConnect();
-                        }
-                    }
-                    catch { }
-
-                    // Warte auf VPN-Verbindung (2FA etc.)
-                    _lblWtsInfo.ForeColor = Clr.Org;
-                    _lblWtsInfo.Text = "\u23f3 Warte auf VPN-Verbindung (2FA)...";
-                    _btnWts.Enabled = true;
-                    _btnWts.Text = "\u2716  ABBRECHEN";
-                    _btnWts.BgNormal = Clr.RedD; _btnWts.BgHover = Clr.RedHi;
-                    _btnWts.Invalidate();
-
-                    // Fokus zurueckholen nach OpenVPN-GUI Start (mehrere Versuche)
-                    int focusAttempts = 0;
-                    var focusTimer = new Timer();
-                    focusTimer.Interval = 800;
-                    focusTimer.Tick += (ft, fe) =>
-                    {
-                        focusAttempts++;
-                        if (focusAttempts >= 5) { focusTimer.Stop(); focusTimer.Dispose(); return; }
-                        try { Activate(); BringToFront(); } catch { }
-                    };
-                    focusTimer.Start();
-
-                    var vpnTimer = new Timer();
-                    vpnTimer.Interval = 2000;
-                    int elapsed = 0;
-                    int maxWait = 120;
-                    bool cancelled = false;
-
-                    // Abbrechen-Handler: Button-Click stoppt den Timer
-                    EventHandler cancelHandler = null;
-                    cancelHandler = (cs, ce) =>
-                    {
-                        _rdpLaunchInProgress = false;
-                        _vpnWaitActive = false;
-                        _activeCancelHandler = null;
-                        cancelled = true;
-                        vpnTimer.Stop(); vpnTimer.Dispose();
-                        _btnWts.Click -= cancelHandler;
-                        _btnWts.Click += _wtsClickHandler;
-                        ResetWtsButton();
-                        _lblWtsInfo.ForeColor = Clr.T2;
-                        _lblWtsInfo.Text = "VPN-Verbindung abgebrochen";
-                        Activate(); BringToFront(); Focus();
-                    };
-
-                    // Original Click-Handler tempor\u00e4r ersetzen
-                    _btnWts.Click -= _wtsClickHandler;
-                    _btnWts.Click += cancelHandler;
-                    _vpnWaitActive = true;
-                    _activeCancelHandler = cancelHandler;
-
-                    vpnTimer.Tick += (ts, te) =>
-                    {
-                        if (cancelled) { vpnTimer.Stop(); vpnTimer.Dispose(); return; }
-                        elapsed += 2;
-                        if (NetDetect.IsVpnConnected())
-                        {
-                            vpnTimer.Stop(); vpnTimer.Dispose();
-                            _vpnWaitActive = false;
-                            _activeCancelHandler = null;
-                            _btnWts.Click -= cancelHandler;
-                            _btnWts.Click += _wtsClickHandler;
-                            _lblWtsInfo.ForeColor = Clr.Org;
-                            _lblWtsInfo.Text = "\u23f3 VPN verbunden \u2013 pr\u00fcfe Tunnel-Stabilit\u00e4t...";
-                            _btnWts.Enabled = false;
-                            _btnWts.Text = "\u23f3  PR\u00dcFE TUNNEL...";
-                            _btnWts.BgNormal = Clr.OrgD; _btnWts.BgHover = Clr.OrgHi;
-                            _btnWts.Invalidate();
-                            StartTunnelCheck(rdpFile, found);
-                        }
-                        else if (elapsed >= maxWait)
-                        {
-                            vpnTimer.Stop(); vpnTimer.Dispose();
-                            _vpnWaitActive = false;
-                            _activeCancelHandler = null;
-                            _btnWts.Click -= cancelHandler;
-                            _btnWts.Click += _wtsClickHandler;
-                            ResetWtsButton();
-                            _lblWtsInfo.ForeColor = Clr.Red;
-                            _lblWtsInfo.Text = "\u26a0 VPN-Timeout \u2013 keine Verbindung nach " + maxWait + "s";
-                        }
-                        else
-                        {
-                            _lblWtsInfo.Text = "\u23f3 Warte auf VPN... (" + elapsed + "s) \u2013 2FA best\u00e4tigen oder abbrechen";
-                        }
-                    };
-                    vpnTimer.Start();
+                    StartVpnAndWait(rdpFile, found, gen);
                     return;
                 }
             }
@@ -1354,12 +1316,117 @@ namespace LoginPilot
             DoLaunchRdp(rdpFile, found);
         }
 
+        bool IsVpnGuiRunning()
+        {
+            try
+            {
+                string exeName = Path.GetFileNameWithoutExtension(_cfg.VpnCommand);
+                var procs = System.Diagnostics.Process.GetProcessesByName(exeName);
+                bool running = procs.Length > 0;
+                foreach (var pr in procs) pr.Dispose();
+                return running;
+            }
+            catch { return false; }
+        }
+
+        // Stellt sicher, dass die OpenVPN-GUI laeuft, sendet den Connect-Befehl
+        // und wartet auf die Verbindung (2FA). Wird nur nach einem Klick des Nutzers aufgerufen.
+        void StartVpnAndWait(string rdpFile, string found, int gen)
+        {
+            _vpnWaitActive = true;
+            _lblWtsInfo.ForeColor = Clr.Org;
+            _lblWtsInfo.Text = "\u23f3 Warte auf VPN-Verbindung (2FA)...";
+            _btnWts.Enabled = true;
+            _btnWts.Text = "\u2716  ABBRECHEN";
+            _btnWts.BgNormal = Clr.RedD; _btnWts.BgHover = Clr.RedHi;
+            _btnWts.Invalidate();
+
+            if (IsVpnGuiRunning())
+            {
+                // GUI laeuft schon -> direkt connect senden
+                SendVpnConnect(gen, true);
+            }
+            else
+            {
+                // GUI erst starten
+                try
+                {
+                    var psi = new System.Diagnostics.ProcessStartInfo();
+                    psi.FileName = _cfg.VpnCommand;
+                    psi.UseShellExecute = true;
+                    System.Diagnostics.Process.Start(psi);
+                }
+                catch
+                {
+                    EndLaunch("\u26a0 VPN-Programm konnte nicht gestartet werden", Clr.Red, true);
+                    return;
+                }
+
+                // Warten bis der GUI-Prozess wirklich da ist (max. 15s), dann connect senden
+                int waitedMs = 0;
+                var guiTimer = NewLaunchTimer(500);
+                guiTimer.Tick += (gs, ge) =>
+                {
+                    if (gen != _launchGen) { StopLaunchTimer(guiTimer); return; }
+                    waitedMs += 500;
+                    if (IsVpnGuiRunning())
+                    {
+                        StopLaunchTimer(guiTimer);
+                        // Die GUI braucht nach dem Prozessstart noch etwas, bis sie Befehle annimmt
+                        var graceTimer = NewLaunchTimer(3000);
+                        graceTimer.Tick += (rs, re) =>
+                        {
+                            StopLaunchTimer(graceTimer);
+                            if (gen != _launchGen) return;
+                            SendVpnConnect(gen, true);
+                        };
+                        graceTimer.Start();
+                    }
+                    else if (waitedMs >= 15000)
+                    {
+                        EndLaunch("\u26a0 VPN-Programm startet nicht \u2013 bitte OpenVPN pr\u00fcfen", Clr.Red, true);
+                    }
+                };
+                guiTimer.Start();
+            }
+            if (gen != _launchGen) return; // SendVpnConnect ist bereits fehlgeschlagen
+
+            // Warte auf VPN-Verbindung (2FA etc.)
+            int elapsed = 0;
+            int maxWait = 120;
+            var vpnTimer = NewLaunchTimer(2000);
+            vpnTimer.Tick += (ts, te) =>
+            {
+                if (gen != _launchGen) { StopLaunchTimer(vpnTimer); return; }
+                elapsed += 2;
+                if (NetDetect.IsVpnConnected())
+                {
+                    StopAllLaunchTimers(); // auch das Nach-vorne-holen von OpenVPN beenden
+                    _vpnWaitActive = false;
+                    SetWtsBusy("\u23f3  PR\u00dcFE TUNNEL...", "\u23f3 VPN verbunden \u2013 pr\u00fcfe Tunnel-Stabilit\u00e4t...");
+                    StartTunnelCheck(rdpFile, found, gen);
+                }
+                else if (elapsed >= maxWait)
+                {
+                    // Sperre wird hier (anders als bis v3.3) wieder geloest -> erneuter Klick funktioniert
+                    EndLaunch("\u26a0 VPN-Timeout \u2013 keine Verbindung nach " + maxWait + "s", Clr.Red, true);
+                }
+                else
+                {
+                    _lblWtsInfo.Text = "\u23f3 Warte auf VPN... (" + elapsed + "s) \u2013 2FA best\u00e4tigen oder abbrechen";
+                }
+            };
+            vpnTimer.Start();
+        }
+
         [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
         [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
         [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hWnd);
 
-        void BringOpenVpnToFront()
+        // Holt ein sichtbares OpenVPN-Fenster nach vorn. true = Fenster gefunden.
+        bool BringOpenVpnToFront()
         {
+            bool found = false;
             try
             {
                 string exeName = Path.GetFileNameWithoutExtension(_cfg.VpnCommand);
@@ -1371,14 +1438,19 @@ namespace LoginPilot
                         if (IsIconic(p.MainWindowHandle))
                             ShowWindow(p.MainWindowHandle, 9); // SW_RESTORE
                         SetForegroundWindow(p.MainWindowHandle);
+                        found = true;
                     }
                     p.Dispose();
                 }
             }
             catch { }
+            return found;
         }
 
-        void SendVpnConnect()
+        // Sendet den Connect-Befehl an die OpenVPN-GUI und holt deren Fenster EINMAL nach vorn.
+        // allowRetry: Befehl einmalig wiederholen, falls 10s lang kein OpenVPN-Fenster erscheint
+        // (GUI hat den Befehl verschluckt). Solange ein Fenster offen ist (PIN-Eingabe), wird nichts wiederholt.
+        void SendVpnConnect(int gen, bool allowRetry)
         {
             try
             {
@@ -1387,62 +1459,40 @@ namespace LoginPilot
                 psi.Arguments = _cfg.VpnArgs;
                 psi.UseShellExecute = true;
                 System.Diagnostics.Process.Start(psi);
-
-                // Nach 1.5s OpenVPN-Fenster in den Vordergrund bringen (PIN-Eingabe)
-                var bringToFrontTimer = new Timer();
-                bringToFrontTimer.Interval = 1500;
-                int attempts = 0;
-                bringToFrontTimer.Tick += (bt, be) =>
-                {
-                    attempts++;
-                    BringOpenVpnToFront();
-                    if (attempts >= 3)
-                    {
-                        bringToFrontTimer.Stop(); bringToFrontTimer.Dispose();
-                    }
-                };
-                bringToFrontTimer.Start();
-
-                // Retry nach 4s falls GUI den Connect-Befehl verschluckt hat
-                var retryTimer = new Timer();
-                retryTimer.Interval = 4000;
-                retryTimer.Tick += (rt, re) =>
-                {
-                    retryTimer.Stop(); retryTimer.Dispose();
-                    if (!NetDetect.IsVpnConnected())
-                    {
-                        try
-                        {
-                            var psi2 = new System.Diagnostics.ProcessStartInfo();
-                            psi2.FileName = _cfg.VpnCommand;
-                            psi2.Arguments = _cfg.VpnArgs;
-                            psi2.UseShellExecute = true;
-                            System.Diagnostics.Process.Start(psi2);
-
-                            // Nochmal Fenster in den Vordergrund
-                            var retry2 = new Timer();
-                            retry2.Interval = 1500;
-                            retry2.Tick += (r2t, r2e) => { retry2.Stop(); retry2.Dispose(); BringOpenVpnToFront(); };
-                            retry2.Start();
-                        }
-                        catch { }
-                    }
-                };
-                retryTimer.Start();
             }
-            catch { }
+            catch
+            {
+                EndLaunch("\u26a0 VPN-Verbindungsbefehl fehlgeschlagen", Clr.Red, true);
+                return;
+            }
+
+            int tries = 0;
+            var frontTimer = NewLaunchTimer(1000);
+            frontTimer.Tick += (bt, be) =>
+            {
+                if (gen != _launchGen || NetDetect.IsVpnConnected()) { StopLaunchTimer(frontTimer); return; }
+                tries++;
+                if (BringOpenVpnToFront()) { StopLaunchTimer(frontTimer); return; } // einmal nach vorn, danach in Ruhe lassen
+                if (tries >= 10)
+                {
+                    StopLaunchTimer(frontTimer);
+                    if (allowRetry) SendVpnConnect(gen, false);
+                    else _lblWtsInfo.Text = "\u23f3 Kein OpenVPN-Fenster sichtbar \u2013 bitte OpenVPN-Symbol pr\u00fcfen";
+                }
+            };
+            frontTimer.Start();
         }
 
-        void StartTunnelCheck(string rdpFile, string foundPath)
+        void StartTunnelCheck(string rdpFile, string foundPath, int gen)
         {
-            var stabilityTimer = new Timer();
-            stabilityTimer.Interval = 2500;
+            var stabilityTimer = NewLaunchTimer(2500);
             int stabilityChecks = 0;
             int successCount = 0;
             int requiredSuccesses = 2;
             int maxStabilityChecks = 12;
             stabilityTimer.Tick += (ss, se) =>
             {
+                if (gen != _launchGen) { StopLaunchTimer(stabilityTimer); return; }
                 stabilityChecks++;
                 string rdpHost = NetDetect.ExtractRdpHost(foundPath);
                 bool reachable = false;
@@ -1458,26 +1508,21 @@ namespace LoginPilot
 
                 if (successCount >= requiredSuccesses)
                 {
-                    stabilityTimer.Stop(); stabilityTimer.Dispose();
+                    StopLaunchTimer(stabilityTimer);
                     _lblWtsInfo.ForeColor = Clr.Grn;
                     _lblWtsInfo.Text = "\u2713 VPN-Tunnel steht \u2013 starte RDP...";
-                    var launchTimer = new Timer();
-                    launchTimer.Interval = 2000;
+                    var launchTimer = NewLaunchTimer(2000);
                     launchTimer.Tick += (ls, le) =>
                     {
-                        launchTimer.Stop(); launchTimer.Dispose();
+                        StopLaunchTimer(launchTimer);
+                        if (gen != _launchGen) return;
                         DoLaunchRdp(rdpFile, foundPath);
                     };
                     launchTimer.Start();
                 }
                 else if (stabilityChecks >= maxStabilityChecks)
                 {
-                    stabilityTimer.Stop(); stabilityTimer.Dispose();
-                    _rdpLaunchInProgress = false; // FIX: Guard zurücksetzen bei Tunnel-Timeout
-                    _btnWts.Enabled = true;
-                    _btnWts.Text = "\u25b6  ARBEITSPLATZ STARTEN";
-                    _lblWtsInfo.ForeColor = Clr.Red;
-                    _lblWtsInfo.Text = "\u26a0 VPN steht, aber RDP-Host nicht erreichbar";
+                    EndLaunch("\u26a0 VPN steht, aber RDP-Host nicht erreichbar", Clr.Red, true);
                 }
                 else
                 {
@@ -1490,15 +1535,17 @@ namespace LoginPilot
 
         void DoLaunchRdp(string rdpFile, string foundPath)
         {
-            _rdpLaunchInProgress = false; // FIX: Guard zurücksetzen
+            _launchGen++;
+            StopAllLaunchTimers();
+            _rdpLaunchInProgress = false;
+            _vpnWaitActive = false;
             if (RdpLauncher.Launch(rdpFile))
             {
                 SetWtsConnected(rdpFile);
             }
             else
             {
-                _btnWts.Enabled = true;
-                _btnWts.Text = "\u25b6  ARBEITSPLATZ STARTEN";
+                ResetWtsButton();
                 MessageBox.Show("Fehler beim Starten von:\n" + foundPath, "Arbeitsplatz", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
@@ -1528,6 +1575,7 @@ namespace LoginPilot
         void UpdateWtsInfo()
         {
             if (!_cfg.EnableRdp) { _lblWtsInfo.Text = ""; return; }
+            if (_rdpLaunchInProgress) return; // laufenden Verbindungsvorgang nicht ueberschreiben
             if (!_wtsConnected) ResetWtsButton();
             string rdp = GetCurrentRdpFile();
             if (!string.IsNullOrEmpty(rdp))
@@ -1881,29 +1929,20 @@ namespace LoginPilot
             }
         }
 
-        bool _vpnWaitActive = false;
-        EventHandler _activeCancelHandler = null;
+        readonly DateTime _appStartUtc = DateTime.UtcNow;
+        bool _startupAutoLaunchDone = false;
 
         void HandleResume()
         {
-            // Hard-Reset: Button-State komplett zuruecksetzen
+            // Hard-Reset: laufenden Verbindungsvorgang inkl. aller Timer beenden, Button zuruecksetzen
             _wtsConnected = false;
-            _rdpLaunchInProgress = false;
-
-            // Falls ein Cancel-Handler aktiv ist, diesen entfernen und Original wiederherstellen
-            if (_vpnWaitActive && _activeCancelHandler != null)
-            {
-                try { _btnWts.Click -= _activeCancelHandler; } catch { }
-                try { _btnWts.Click += _wtsClickHandler; } catch { }
-                _activeCancelHandler = null;
-            }
-            _vpnWaitActive = false;
-            ResetWtsButton();
+            _startupAutoLaunchDone = true; // nach Standby/Hibernate nie automatisch verbinden
+            EndLaunch(null, Clr.T2, false);
 
             // Netzwerk-Hash zuruecksetzen damit DoNetworkRecheck auf jeden Fall durchlaeuft
             _lastNetworkHash = "";
 
-            // Nach Resume warten bis Netzwerk steht, dann Neuerkennung
+            // Nach Resume warten bis Netzwerk steht, dann Neuerkennung (nur Proxy/Standort, kein VPN-Start)
             ScheduleNetworkRecheck(5000);
         }
 
@@ -1936,9 +1975,14 @@ namespace LoginPilot
             AutoDetect();
             RebuildTrayMenu();
 
-            // Im HomeOffice: automatisch VPN + RDP starten
-            if (_cfg.EnableRdp && !ProxyManager.IsEnabled() && !_wtsConnected && !_rdpLaunchInProgress) // FIX: Nicht starten wenn bereits verbunden oder Vorgang läuft
+            // Automatischer Start von VPN + RDP nur einmalig direkt nach dem Programmstart (Anmeldung),
+            // NICHT nach Standby/Aufklappen oder spaeteren Netzwerkwechseln. Sonst startet der Nutzer
+            // die Verbindung selbst ueber "Arbeitsplatz starten".
+            bool startupWindow = (DateTime.UtcNow - _appStartUtc).TotalSeconds < 120;
+            if (_cfg.EnableRdp && startupWindow && !_startupAutoLaunchDone
+                && !ProxyManager.IsEnabled() && !_wtsConnected && !_rdpLaunchInProgress)
             {
+                _startupAutoLaunchDone = true;
                 // Kurz warten bis Netzwerk stabil ist, dann Arbeitsplatz starten
                 var autoLaunchTimer = new Timer();
                 autoLaunchTimer.Interval = 3000;
