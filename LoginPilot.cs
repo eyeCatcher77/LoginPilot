@@ -1,5 +1,7 @@
 // ============================================
-// LoginPilot v3.3 - Proxy, VPN & Arbeitsplatz Manager
+// LoginPilot v3.4 - Proxy, VPN & Arbeitsplatz Manager
+// v3.4: Kein automatischer VPN-Start nach Standby/Netzwerkwechsel, Verbindungsvorgang robuster
+//       (Sperre nach VPN-Timeout behoben, OpenVPN-Fenster nur einmal nach vorn)
 // v3.3: WinHTTP-Proxy wird jetzt synchron mit User-Proxy gesetzt/zurueckgesetzt
 //       (Fix fuer Microsoft Store / winget / Windows Update Downloads im HomeOffice)
 //
@@ -377,7 +379,7 @@ namespace LoginPilot
     // ========== AUTO-UPDATE ==========
     public static class AutoUpdater
     {
-        const string CurrentVersion    = "3.3";
+        const string CurrentVersion    = "3.4";
         const string VersionUrl        = "https://raw.githubusercontent.com/eyeCatcher77/LoginPilot/main/version.txt";
         const string ExeUrl            = "https://raw.githubusercontent.com/eyeCatcher77/LoginPilot/main/LoginPilot.exe";
         const int    TimeoutMs         = 5000; // Kein langer Haenger beim Start
@@ -988,7 +990,7 @@ namespace LoginPilot
             };
             _mainPage.Controls.Add(btnTheme);
 
-            var ver = AL("v3.3", new Font("Segoe UI", 7.5f), Clr.Brd, CW, 800);
+            var ver = AL("v3.4", new Font("Segoe UI", 7.5f), Clr.Brd, CW, 800);
             ver.Tag = "version";
             _mainPage.Controls.Add(ver);
         }
