@@ -1258,6 +1258,7 @@ namespace LoginPilot
 
             _rdpLaunchInProgress = true;
             _wtsConnected = false; // Bei jedem Klick zuruecksetzen
+            _startupAutoLaunchDone = true; // nach dem ersten Start (auch manuell) nie mehr automatisch verbinden
             int gen = ++_launchGen;
             StopAllLaunchTimers();
             ResetWtsButton();
