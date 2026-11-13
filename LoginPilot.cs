@@ -1914,7 +1914,40 @@ namespace LoginPilot
             NetworkChange.NetworkAddressChanged += OnNetworkChanged;
             // Bei Resume aus Sleep/Hibernate
             SystemEvents.PowerModeChanged += OnPowerModeChanged;
+            // Nach Entsperren / Bildschirmwechsel das Fenster komplett neu zeichnen
+            // (sonst bleiben nach Standby teils leere oder dunkle Flaechen stehen)
+            SystemEvents.SessionSwitch += (s, e) =>
+            {
+                if (e.Reason == SessionSwitchReason.SessionUnlock || e.Reason == SessionSwitchReason.SessionLogon
+                    || e.Reason == SessionSwitchReason.ConsoleConnect || e.Reason == SessionSwitchReason.RemoteConnect)
+                    RepaintSoon();
+            };
+            SystemEvents.DisplaySettingsChanged += (s, e) => RepaintSoon();
         }
+
+        // Zeichnet das gesamte Fenster inkl. aller Unterelemente neu
+        void ForceRepaint()
+        {
+            try { if (!IsDisposed && Visible) { Invalidate(true); Update(); } } catch { }
+        }
+
+        // Neuzeichnen sofort und nochmals nach 1,5s (direkt nach dem Aufwachen ist die Anzeige oft noch nicht bereit)
+        void RepaintSoon()
+        {
+            try
+            {
+                if (IsDisposed || !IsHandleCreated) return;
+                if (InvokeRequired) { BeginInvoke(new Action(RepaintSoon)); return; }
+                ForceRepaint();
+                var t = new Timer();
+                t.Interval = 1500;
+                t.Tick += (s, e) => { t.Stop(); t.Dispose(); ForceRepaint(); };
+                t.Start();
+            }
+            catch { }
+        }
+
+        protected override void OnActivated(EventArgs e) { base.OnActivated(e); try { Invalidate(true); } catch { } }
 
         void OnNetworkChanged(object sender, EventArgs e)
         {
@@ -1947,6 +1980,7 @@ namespace LoginPilot
 
             // Nach Resume warten bis Netzwerk steht, dann Neuerkennung (nur Proxy/Standort, kein VPN-Start)
             ScheduleNetworkRecheck(5000);
+            RepaintSoon();
         }
 
         void ScheduleNetworkRecheck(int delayMs = 2000)
@@ -1958,6 +1992,7 @@ namespace LoginPilot
             {
                 _netDebounce.Stop(); _netDebounce.Dispose(); _netDebounce = null;
                 DoNetworkRecheck();
+                ForceRepaint();
             };
             _netDebounce.Start();
         }
