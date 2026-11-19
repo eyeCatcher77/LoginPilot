@@ -1055,6 +1055,28 @@ namespace LoginPilot
                 Check("Rotation: nur eine Generation (.1 ersetzt, kein .2)", File.ReadAllText(lp + ".1").StartsWith("b") && !File.Exists(lp + ".2"));
                 Log.Write("Test", "klein");
                 Check("Keine Rotation unter 300 KB", File.ReadAllText(lp).Contains("zweite Rotation"));
+
+                // Benutzer-Autostart: Entscheidung ohne Registry
+                string want = AutostartManager.BuildRunCommand(@"C:\Program Files\Login Pilot\LoginPilot.exe");
+                Check("Autostart-Befehlszeile mit Leerzeichen im Pfad", want == "\"C:\\Program Files\\Login Pilot\\LoginPilot.exe\" /autostart");
+                string[] curNames = { "Eintrag fehlt", "Eintrag stimmt", "falscher Pfad" };
+                string[] curVals = { null, want, "\"C:\\Alt\\LoginPilot.exe\" /autostart" };
+                var N = AutostartManager.UserAction.Nothing; var R = AutostartManager.UserAction.Remove;
+                var exp = new AutostartManager.UserAction[] {
+                    AutostartManager.UserAction.Set, N, AutostartManager.UserAction.Repair, // Aufgabe nein, abgeschaltet nein
+                    N, R, R,  // Aufgabe nein, abgeschaltet ja
+                    N, R, R,  // Aufgabe ja, abgeschaltet nein
+                    N, R, R }; // Aufgabe ja, abgeschaltet ja
+                foreach (bool task in new[] { false, true })
+                    foreach (bool dis in new[] { false, true })
+                        for (int i = 0; i < 3; i++)
+                        {
+                            var e = exp[(task ? 6 : 0) + (dis ? 3 : 0) + i];
+                            Check("Autostart Aufgabe " + (task ? "ja" : "nein") + ", abgeschaltet " + (dis ? "ja" : "nein") + ", " + curNames[i] + " -> " + e,
+                                AutostartManager.DecideUserAutostart(task, dis, curVals[i], want) == e);
+                        }
+                Check("Autostart Eintrag stimmt (andere Gross-/Kleinschreibung) -> Nothing", AutostartManager.DecideUserAutostart(false, false, want.ToUpperInvariant(), want) == N);
+                Check("Autostart leerer Eintrag gilt als fehlend -> Set", AutostartManager.DecideUserAutostart(false, false, "", want) == AutostartManager.UserAction.Set);
             }
             catch (Exception ex)
             {
@@ -1075,6 +1097,87 @@ namespace LoginPilot
     public static class AutostartManager
     {
         const string TaskName = "LoginPilot_Autostart";
+
+        // ---- Autostart je Benutzer (HKCU Run-Schluessel, ohne Adminrechte) ----
+        const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        const string RunValue = "LoginPilot";
+        const string SettingsKey = @"Software\LoginPilot";
+        const string DisabledValue = "AutostartDisabled";
+
+        public enum UserAction { Nothing, Set, Repair, Remove }
+
+        // Reine Entscheidung ohne Registry-Zugriff (im Selbsttest geprueft)
+        public static UserAction DecideUserAutostart(bool taskExists, bool disabled, string current, string desired)
+        {
+            bool has = !string.IsNullOrEmpty(current);
+            if (taskExists || disabled) return has ? UserAction.Remove : UserAction.Nothing;
+            if (!has) return UserAction.Set;
+            return string.Equals(current.Trim(), desired, StringComparison.OrdinalIgnoreCase) ? UserAction.Nothing : UserAction.Repair;
+        }
+
+        public static string BuildRunCommand(string exePath) { return "\"" + exePath + "\" /autostart"; }
+
+        public static bool IsUserAutostartEnabled()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(SettingsKey, false))
+                {
+                    object v = k == null ? null : k.GetValue(DisabledValue);
+                    return !(v is int && (int)v == 1);
+                }
+            }
+            catch { return true; }
+        }
+
+        // Setzt, repariert oder entfernt den Run-Eintrag; Fehler werden nur protokolliert
+        public static string EnsureUserAutostart()
+        {
+            string result;
+            try
+            {
+                bool task = IsInstalled();
+                bool disabled = !IsUserAutostartEnabled();
+                string desired = BuildRunCommand(Application.ExecutablePath);
+                using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
+                {
+                    string current = k.GetValue(RunValue) as string;
+                    switch (DecideUserAutostart(task, disabled, current, desired))
+                    {
+                        case UserAction.Set: k.SetValue(RunValue, desired); result = "Autostart-Eintrag gesetzt: " + desired; break;
+                        case UserAction.Repair: k.SetValue(RunValue, desired); result = "Autostart-Eintrag repariert: " + current + " -> " + desired; break;
+                        case UserAction.Remove: k.DeleteValue(RunValue, false); result = "Autostart-Eintrag entfernt (" + (task ? "geplante Aufgabe vorhanden" : "abgeschaltet") + ")"; break;
+                        default: result = task ? "Autostart-Eintrag uebersprungen (geplante Aufgabe vorhanden)" : disabled ? "Autostart fuer diesen Benutzer abgeschaltet" : "Autostart-Eintrag stimmt"; break;
+                    }
+                }
+            }
+            catch (Exception ex) { result = "Autostart-Eintrag Fehler: " + Log.Describe(ex); }
+            Log.Write("Autostart", result);
+            return result;
+        }
+
+        public static void SetUserAutostart(bool on)
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.CreateSubKey(SettingsKey))
+                {
+                    if (on) k.DeleteValue(DisabledValue, false);
+                    else k.SetValue(DisabledValue, 1, RegistryValueKind.DWord);
+                }
+                Log.Write("Autostart", "Autostart fuer diesen Benutzer " + (on ? "eingeschaltet" : "abgeschaltet"));
+            }
+            catch (Exception ex) { Log.Write("Autostart", "Autostart-Schalter Fehler: " + Log.Describe(ex)); }
+            EnsureUserAutostart();
+        }
+
+        // LoginPilot.exe /autostartcheck: nur EnsureUserAutostart, ohne Fenster und Mutex
+        public static int RunCheckHeadless()
+        {
+            string r = EnsureUserAutostart();
+            try { Console.WriteLine(r); } catch { }
+            return 0;
+        }
 
         // Startup-Ordner-Pfade (nur noch fuer Altbestand-Bereinigung)
         static string StartupFolder { get { return Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup); } }
@@ -1315,6 +1418,8 @@ namespace LoginPilot
 
         ListBox _lstProfiles;
         SButton _btnAdd, _btnRemove, _btnSave, _btnBack, _btnBrowseLogo;
+        Label _lblAutostartHint;
+        CheckBox _chkUserAutostart;
         CheckBox _chkAutoDetect, _chkLockConfig, _chkAutostart, _chkStartMin, _chkEnableRdp, _chkEnableVpn, _chkHomeOffice;
         TextBox _txtName, _txtServer, _txtPort, _txtExceptions, _txtSubnet, _txtRdp, _txtLogo, _txtRdpOff, _txtVpnCmd, _txtVpnArgs;
         Panel _pnlRdpSettings, _pnlVpnSettings;
@@ -1836,8 +1941,17 @@ namespace LoginPilot
             _chkAutoDetect = new CheckBox { Text = "  Standort beim Start automatisch erkennen", Location = new Point(M, y), Size = new Size(SCW, 22), ForeColor = Clr.T1, Font = fc, BackColor = Clr.Bg, Checked = _cfg.AutoDetectOnStart };
             _cfgPage.Controls.Add(_chkAutoDetect); y += 24;
 
-            _chkAutostart = new CheckBox { Text = "  Autostart f\u00fcr alle Benutzer", Location = new Point(M, y), Size = new Size(SCW, 22), ForeColor = Clr.T1, Font = fc, BackColor = Clr.Bg, Checked = AutostartManager.IsInstalled() };
-            _cfgPage.Controls.Add(_chkAutostart); y += 24;
+            bool taskInstalled = AutostartManager.IsInstalled();
+            _chkUserAutostart = new CheckBox { Text = "  Autostart f\u00fcr diesen Benutzer (ohne Adminrechte)", Location = new Point(M, y), Size = new Size(SCW, 22), ForeColor = Clr.T1, Font = fc, BackColor = Clr.Bg, Checked = AutostartManager.IsUserAutostartEnabled() };
+            _cfgPage.Controls.Add(_chkUserAutostart); y += 24;
+
+            // Hoehe 34: langer Text darf bei schmaler Seite umbrechen
+            _chkAutostart = new CheckBox { Text = "  Autostart f\u00fcr alle Benutzer (geplante Aufgabe, Adminrechte)", Location = new Point(M, y), Size = new Size(SCW, 34), ForeColor = Clr.T1, Font = fc, BackColor = Clr.Bg, Checked = taskInstalled };
+            _cfgPage.Controls.Add(_chkAutostart); y += 36;
+
+            _lblAutostartHint = AL("Autostart l\u00e4uft \u00fcber die geplante Aufgabe", new Font("Segoe UI", 8f, FontStyle.Italic), Clr.T2, M, y);
+            _lblAutostartHint.Visible = taskInstalled;
+            _cfgPage.Controls.Add(_lblAutostartHint); y += 20;
 
             _chkStartMin = new CheckBox { Text = "  Minimiert starten (nur Tray-Icon)", Location = new Point(M, y), Size = new Size(SCW, 22), ForeColor = Clr.T1, Font = fc, BackColor = Clr.Bg, Checked = _cfg.StartMinimized };
             _cfgPage.Controls.Add(_chkStartMin); y += 24;
@@ -1956,7 +2070,7 @@ namespace LoginPilot
             catch { }
         }
 
-        void ShowMainWindow()
+        internal void ShowMainWindow()
         {
             Show(); ShowInTaskbar = true; WindowState = FormWindowState.Normal; BringToFront(); Activate();
         }
@@ -2534,6 +2648,10 @@ namespace LoginPilot
             if (_chkAutostart.Checked && !AutostartManager.IsInstalled())
             { if (!AutostartManager.InstallSimple()) MessageBox.Show("Autostart konnte nicht eingerichtet werden.\nBitte als Administrator.", "Hinweis", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
             else if (!_chkAutostart.Checked && AutostartManager.IsInstalled()) AutostartManager.Uninstall();
+            // Benutzer-Autostart: Schalter umsetzen bzw. Eintrag an geaenderte Aufgabe anpassen
+            if (_chkUserAutostart.Checked != AutostartManager.IsUserAutostartEnabled()) AutostartManager.SetUserAutostart(_chkUserAutostart.Checked);
+            else AutostartManager.EnsureUserAutostart();
+            _lblAutostartHint.Visible = AutostartManager.IsInstalled();
 
             _isFirstStart = false;
             RefreshProfileList(); PopulateCombo(); RebuildTrayMenu();
@@ -2545,7 +2663,10 @@ namespace LoginPilot
         void ShowConfig()
         {
             _mainPage.Visible = false; _cfgPage.Visible = true; _cfgPage.BringToFront();
-            _chkAutostart.Checked = AutostartManager.IsInstalled();
+            bool taskInstalled = AutostartManager.IsInstalled();
+            _chkAutostart.Checked = taskInstalled;
+            _lblAutostartHint.Visible = taskInstalled;
+            _chkUserAutostart.Checked = AutostartManager.IsUserAutostartEnabled();
             RefreshProfileList(); if (_lstProfiles.Items.Count > 0) _lstProfiles.SelectedIndex = 0;
         }
 
@@ -2845,17 +2966,59 @@ namespace LoginPilot
             try { if (_mutex != null) { _mutex.ReleaseMutex(); _mutex.Dispose(); _mutex = null; } } catch { }
         }
 
+        // Zweite Instanz (Doppelklick) bittet die laufende Instanz ueber dieses Ereignis, ihr Fenster zu zeigen
+        const string ShowEventName = "LoginPilot_ShowWindow";
+        static System.Threading.EventWaitHandle _showEvent;
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool AllowSetForegroundWindow(int dwProcessId);
+
+        static void StartShowWindowListener(MainForm form)
+        {
+            try
+            {
+                _showEvent = new System.Threading.EventWaitHandle(false, System.Threading.EventResetMode.AutoReset, ShowEventName);
+                var t = new System.Threading.Thread(() =>
+                {
+                    while (true)
+                    {
+                        _showEvent.WaitOne();
+                        Log.Write("Start", "Zweite Instanz hat das Fenster angefordert");
+                        try { if (form.IsHandleCreated) form.BeginInvoke(new Action(form.ShowMainWindow)); } catch { }
+                    }
+                }) { IsBackground = true, Name = "ShowWindowListener" };
+                t.Start();
+            }
+            catch (Exception ex) { Log.Write("Start", "Fenster-Ereignis nicht verfuegbar: " + Log.Describe(ex)); }
+        }
+
+        // true = laufende Instanz lauscht und wurde benachrichtigt (aeltere Versionen lauschen nicht)
+        static bool SignalShowWindow()
+        {
+            try
+            {
+                using (var ev = System.Threading.EventWaitHandle.OpenExisting(ShowEventName))
+                {
+                    AllowSetForegroundWindow(-1); // ASFW_ANY: laufende Instanz darf in den Vordergrund
+                    return ev.Set();
+                }
+            }
+            catch { return false; }
+        }
+
         [STAThread]
         static int Main(string[] args)
         {
-            bool cfg = false, updated = false;
+            bool cfg = false, updated = false, autostart = false;
             foreach (string a in args)
             {
                 string l = a.ToLowerInvariant();
                 if (l == "/updatecheck") return AutoUpdater.RunHeadless(); // ohne Fenster, Mutex, Neustart
+                if (l == "/autostartcheck") return AutostartManager.RunCheckHeadless(); // ohne Fenster, Mutex
                 if (l == "/selftest") return SelfTest.Run();
                 if (l == "/k" || l == "-k") cfg = true;
                 if (l == "/updated") updated = true;
+                if (l == "/autostart") autostart = true;
             }
 
             // Prozess-Prioritaet erhoehen: LoginPilot startet schneller als normale
@@ -2871,12 +3034,23 @@ namespace LoginPilot
             bool owned;
             try { owned = _mutex.WaitOne(0, false); }
             catch (System.Threading.AbandonedMutexException) { owned = true; }
+            if (!owned && autostart)
+            {
+                // Run-Eintrag und geplante Aufgabe koennen beide starten: zweite Instanz still beenden
+                Log.Write("Start", "Zweite Instanz (/autostart) still beendet");
+                return 0;
+            }
             if (!owned)
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 try { owned = _mutex.WaitOne(15000, false); }
                 catch (System.Threading.AbandonedMutexException) { owned = true; }
                 if (owned) Log.Write("Start", "Auf Freigabe der alten Instanz gewartet: " + (sw.ElapsedMilliseconds / 1000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " s");
+            }
+            if (!owned && !updated && SignalShowWindow())
+            {
+                Log.Write("Start", "Andere Instanz laeuft bereits, Fenster der laufenden Instanz angefordert");
+                return 0;
             }
             if (!owned)
             {
@@ -2887,6 +3061,9 @@ namespace LoginPilot
             Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
 
             var form = new MainForm(cfg, updated);
+            StartShowWindowListener(form);
+            // Benutzer-Autostart setzen/reparieren, im Hintergrund (schtasks-Abfrage blockiert den Start nicht)
+            System.Threading.ThreadPool.QueueUserWorkItem(_ => AutostartManager.EnsureUserAutostart());
             // Auto-Update im Hintergrund pruefen - blockiert den Start nicht
             AutoUpdater.StartBackground();
             Application.Run(form);

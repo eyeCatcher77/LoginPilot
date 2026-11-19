@@ -17,7 +17,7 @@ Lightweight Windows tray tool for automatic proxy switching, VPN launch and RDP 
 - **Tray icon** – color-coded status indicator (green = office, blue = VPN, orange = no connection)
 - **Auto-update** – checks for new versions in the background, verifies the download (SHA-256) and updates silently
 - **Log file** – `loginpilot.log` records connection steps and update checks for troubleshooting
-- **Autostart** – installs as Scheduled Task (starts earlier than regular startup entries)
+- **Autostart** – per user without admin rights (on by default), optionally as Scheduled Task for all users
 - **Dark/Light theme**
 - **Portable** – no installation, config file sits next to the EXE
 
@@ -37,9 +37,9 @@ Lightweight Windows tray tool for automatic proxy switching, VPN launch and RDP 
 2. Place the EXE in a folder of your choice (e.g. `C:\MASTER\`)
 3. Run `LoginPilot.exe` – on first start the settings dialog opens automatically
 4. Configure your proxy profiles and optionally enable RDP/VPN features
-5. Enable autostart in settings if desired
+5. Autostart for the current user is set up automatically (see [Autostart](#autostart))
 
-> **Portable:** The config file `loginpilot_config.xml` is created next to the EXE. No registry entries, no installation directory.
+> **Portable:** The config file `loginpilot_config.xml` is created next to the EXE. No installation directory; the only own registry entries are the per-user autostart values in HKCU.
 
 ---
 
@@ -101,8 +101,25 @@ Command-line options for testing and administration:
 |--------|-------------|
 | `/updatecheck` | Runs exactly one update check including the swap, without window or restart. Exit code: 0 = up to date, 10 = updated, 20 = check failed, 30 = no write access, 40 = hash wrong or missing |
 | `/selftest` | Checks the internal logic offline with dummy data; results in `%TEMP%\loginpilot-selftest.txt`, exit code = number of failures |
+| `/autostart` | Used by the per-user autostart entry; if LoginPilot is already running, this instance exits silently |
+| `/autostartcheck` | Only sets, repairs or removes the per-user autostart entry and prints the result; no window, exit code 0 |
 
 For local tests, the environment variable `LOGINPILOT_UPDATE_URL` can point to a test server. It is only honoured if it starts with `http://localhost:` or `http://127.0.0.1:`; any other value is ignored and logged.
+
+---
+
+## Autostart
+
+**Per user (default, no admin rights):** On every start LoginPilot writes or repairs
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, value `LoginPilot` = `"<full EXE path>" /autostart`
+(also after the EXE has moved). It can be switched off in settings ("Autostart für diesen Benutzer");
+this stores the DWORD `AutostartDisabled` = 1 in `HKCU\Software\LoginPilot` and removes the Run value.
+
+**All users (optional, admin rights):** Scheduled Task `LoginPilot_Autostart` (starts earlier than regular startup entries).
+If the task exists, no per-user Run value is set and an existing one is removed, so LoginPilot starts only once.
+
+**Double start is harmless:** a second start with `/autostart` exits silently; a second manual start waits up to 15 s
+and then brings the window of the running instance to the front.
 
 ---
 
@@ -139,7 +156,7 @@ LoginPilot is designed with a minimal attack surface:
 - No internet connection (except GitHub update check)
 - No credential storage
 - No open ports or network listeners
-- No admin rights required (except optional autostart for all users)
+- No admin rights required (except optional autostart for all users via Scheduled Task)
 - No external DLLs – single file executable
 - Proxy settings written to HKCU only (user scope, not system-wide)
 
