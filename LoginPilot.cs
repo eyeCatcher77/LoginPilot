@@ -176,7 +176,7 @@ namespace LoginPilot
 
         // === v3.3: Self-Healing - WinHTTP an User-Proxy angleichen ===
         // Wird beim Start aufgerufen, um Altlasten (alte WinHTTP-Proxys von v3.2 oder
-        // dem ABRE-Setup-Skript) automatisch zu bereinigen.
+        // einem frueheren Setup-Skript) automatisch zu bereinigen.
         public static void SyncWinHttpWithUserProxy()
         {
             try
@@ -1330,7 +1330,7 @@ namespace LoginPilot
             if (_cfg.DarkTheme) Clr.SetDark(); else Clr.SetLight();
             try { string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "loginpilot_icon.ico"); if (File.Exists(p)) _appIcon = new Icon(p); } catch { }
 
-            // v3.3: Self-Healing - alten WinHTTP-Proxy bereinigen falls noch von v3.2 oder ABRE-Setup vorhanden
+            // v3.3: Self-Healing - alten WinHTTP-Proxy bereinigen falls noch von v3.2 oder einem frueheren Setup-Skript vorhanden
             ProxyManager.SyncWinHttpWithUserProxy();
 
             InitForm(); InitTray(); BuildMainPage(); BuildConfigPage(); LoadLogo(); UpdateMainLayout();
@@ -2865,11 +2865,19 @@ namespace LoginPilot
 
             Log.Write("Start", "LoginPilot v" + AutoUpdater.CurrentVersion + " gestartet, EXE: " + Application.ExecutablePath + (updated ? " (nach Update)" : ""));
 
-            // Nach einem Update bis zu 15 s warten, bis die alte Instanz den Mutex freigibt
+            // Ist der Mutex belegt, still bis zu 15 s warten: der Updater aus 3.3/3.4 startet
+            // die neue EXE ohne /updated und beendet die alte Instanz erst danach
             _mutex = new System.Threading.Mutex(false, "LoginPilot_SingleInstance");
             bool owned;
-            try { owned = _mutex.WaitOne(updated ? 15000 : 0, false); }
+            try { owned = _mutex.WaitOne(0, false); }
             catch (System.Threading.AbandonedMutexException) { owned = true; }
+            if (!owned)
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                try { owned = _mutex.WaitOne(15000, false); }
+                catch (System.Threading.AbandonedMutexException) { owned = true; }
+                if (owned) Log.Write("Start", "Auf Freigabe der alten Instanz gewartet: " + (sw.ElapsedMilliseconds / 1000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " s");
+            }
             if (!owned)
             {
                 Log.Write("Start", "Andere Instanz laeuft bereits, Start abgebrochen");
