@@ -1,5 +1,8 @@
 // ============================================
-// LoginPilot v3.4 - Proxy, VPN & Arbeitsplatz Manager
+// LoginPilot v3.5 - Proxy, VPN & Arbeitsplatz Manager
+// v3.5: Protokoll (loginpilot.log), Updater neu (wiederholte Pruefung, Proxy-Fallback, SHA-256,
+//       Schreibrechte-Pruefung, sicherer Neustart), OpenVPN-Profilpruefung vor dem Connect,
+//       Meldung bei nicht erreichbarem RDP-Host, Selbsttest (/selftest), /updatecheck
 // v3.4: Kein automatischer VPN-Start nach Standby/Netzwerkwechsel, Verbindungsvorgang robuster
 //       (Sperre nach VPN-Timeout behoben, OpenVPN-Fenster nur einmal nach vorn)
 // v3.3: WinHTTP-Proxy wird jetzt synchron mit User-Proxy gesetzt/zurueckgesetzt
@@ -376,89 +379,695 @@ namespace LoginPilot
         }
     }
 
-    // ========== AUTO-UPDATE ==========
-    public static class AutoUpdater
+    // ========== PROTOKOLL ==========
+    // loginpilot.log neben der EXE, sonst %LOCALAPPDATA%\LoginPilot\loginpilot.log.
+    // Thread-sicher, wirft nie nach aussen. Nie PIN, Passwoerter oder .ovpn-Inhalte protokollieren.
+    public static class Log
     {
-        const string CurrentVersion    = "3.4";
-        const string VersionUrl        = "https://raw.githubusercontent.com/eyeCatcher77/LoginPilot/main/version.txt";
-        const string ExeUrl            = "https://raw.githubusercontent.com/eyeCatcher77/LoginPilot/main/LoginPilot.exe";
-        const int    TimeoutMs         = 5000; // Kein langer Haenger beim Start
+        public const long MaxBytes = 300 * 1024;
+        static readonly object _lock = new object();
+        static string _path;
 
-        // Wird im Hintergrund-Thread aufgerufen – blockiert den Start nicht
-        public static void CheckAndUpdateAsync()
+        public static string FilePath
         {
-            var t = new System.Threading.Thread(() =>
-            {
-                try { CheckAndUpdate(); }
-                catch { /* Fehler still ignorieren – Update ist optional */ }
-            });
-            t.IsBackground = true;
-            t.Start();
+            get { lock (_lock) { if (_path == null) _path = ResolvePath(); return _path; } }
         }
 
-        static void CheckAndUpdate()
+        // Nur fuer den Selbsttest
+        public static void SetPath(string path) { lock (_lock) { _path = path; } }
+
+        static string ResolvePath()
         {
+            string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "loginpilot.log");
+            try { using (new FileStream(p, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)) { } return p; }
+            catch { }
+            try
+            {
+                string la = Environment.GetEnvironmentVariable("LOCALAPPDATA");
+                if (string.IsNullOrEmpty(la)) la = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                string dir = Path.Combine(la, "LoginPilot");
+                Directory.CreateDirectory(dir);
+                return Path.Combine(dir, "loginpilot.log");
+            }
+            catch { return p; }
+        }
+
+        public static void Write(string area, string text)
+        {
+            try
+            {
+                lock (_lock)
+                {
+                    string p = FilePath;
+                    RotateIfNeeded(p, MaxBytes);
+                    string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture)
+                        + " [" + area + "] " + text + Environment.NewLine;
+                    File.AppendAllText(p, line, new System.Text.UTF8Encoding(false));
+                }
+            }
+            catch { }
+        }
+
+        // Eine Generation: loginpilot.log -> loginpilot.log.1
+        public static void RotateIfNeeded(string path, long maxBytes)
+        {
+            try
+            {
+                var fi = new FileInfo(path);
+                if (!fi.Exists || fi.Length <= maxBytes) return;
+                string old = path + ".1";
+                if (File.Exists(old)) File.Delete(old);
+                File.Move(path, old);
+            }
+            catch { }
+        }
+
+        public static string Describe(Exception ex)
+        {
+            if (ex == null) return "";
+            return ex.GetType().Name + ": " + ex.Message;
+        }
+    }
+
+    // ========== AUTO-UPDATE ==========
+    // Prueft im Hintergrund: erste Pruefung 20 s nach Start, nach Fehler alle 5 min,
+    // nach Erfolg alle 4 h, zusaetzlich 30 s nach Resume/Netzwerkwechsel.
+    // Die EXE wird nur ersetzt, wenn ihr SHA-256 zu LoginPilot.exe.sha256 passt.
+    public static class AutoUpdater
+    {
+        public const string CurrentVersion = "3.5";
+        const string DefaultBaseUrl = "https://raw.githubusercontent.com/eyeCatcher77/LoginPilot/main/";
+        public const string TestUrlEnv = "LOGINPILOT_UPDATE_URL";
+        const int SmallTimeoutMs = 15000;
+        const int ExeTimeoutMs = 120000;
+
+        public const int ExitUpToDate = 0, ExitUpdated = 10, ExitCheckFailed = 20, ExitNoWriteAccess = 30, ExitHashInvalid = 40;
+        const int SkippedThisRun = 1; // neue Version bekannt, Download in diesem Lauf schon versucht
+
+        static readonly TimeSpan FirstDelay = TimeSpan.FromSeconds(20);
+        static readonly TimeSpan RetryAfterFailure = TimeSpan.FromMinutes(5);
+        static readonly TimeSpan IntervalAfterSuccess = TimeSpan.FromHours(4);
+        static readonly TimeSpan DelayAfterEvent = TimeSpan.FromSeconds(30);
+        static readonly TimeSpan MinGap = TimeSpan.FromMinutes(1);
+
+        // Werden aus dem Hintergrund-Thread ausgeloest
+        public static event Action<string> Installed; // Parameter: neue Version
+        public static event Action<string> Notify;    // Parameter: Hinweistext fuer das Tray
+
+        static readonly object _sync = new object();
+        static readonly System.Threading.AutoResetEvent _wake = new System.Threading.AutoResetEvent(false);
+        static DateTime _nextCheckUtc = DateTime.MaxValue;
+        static bool _started, _downloadAttempted, _writeHintShown;
+
+        public static void StartBackground()
+        {
+            lock (_sync)
+            {
+                if (_started) return;
+                _started = true;
+                _nextCheckUtc = DateTime.UtcNow + FirstDelay;
+            }
+            var t = new System.Threading.Thread(Loop);
+            t.IsBackground = true;
+            t.Name = "LoginPilot-Updater";
+            t.Start();
+            Log.Write("Update", "Hintergrundpruefung gestartet, erste Pruefung in 20 s");
+        }
+
+        // Nach Resume oder Netzwerkwechsel: Pruefung in 30 s (falls nicht ohnehin frueher geplant)
+        public static void RequestSoon(string reason)
+        {
+            lock (_sync)
+            {
+                if (!_started) return;
+                DateTime soon = DateTime.UtcNow + DelayAfterEvent;
+                if (soon >= _nextCheckUtc) return;
+                _nextCheckUtc = soon;
+            }
+            Log.Write("Update", "Pruefung in 30 s angefordert (" + reason + ")");
+            _wake.Set();
+        }
+
+        static void Loop()
+        {
+            DateTime lastRunUtc = DateTime.MinValue;
+            while (true)
+            {
+                try
+                {
+                    DateTime due;
+                    lock (_sync) due = _nextCheckUtc;
+                    if (lastRunUtc != DateTime.MinValue && due < lastRunUtc + MinGap) due = lastRunUtc + MinGap;
+                    DateTime now = DateTime.UtcNow;
+                    if (due > now)
+                    {
+                        double ms = Math.Min((due - now).TotalMilliseconds, 3600000);
+                        _wake.WaitOne((int)Math.Max(ms, 1));
+                        continue;
+                    }
+
+                    lastRunUtc = DateTime.UtcNow;
+                    lock (_sync) _nextCheckUtc = DateTime.MaxValue;
+                    string newVersion;
+                    int code = RunCheck(true, out newVersion);
+                    if (code == ExitUpdated)
+                    {
+                        var h = Installed;
+                        if (h != null) h(newVersion);
+                        return; // Neustart folgt, keine weiteren Pruefungen
+                    }
+                    bool ok = code == ExitUpToDate || code == ExitNoWriteAccess || code == SkippedThisRun
+                        || (code == ExitHashInvalid && _downloadAttempted);
+                    DateTime next = DateTime.UtcNow + (ok ? IntervalAfterSuccess : RetryAfterFailure);
+                    lock (_sync) { if (next < _nextCheckUtc) _nextCheckUtc = next; next = _nextCheckUtc; }
+                    Log.Write("Update", "Naechste Pruefung um " + next.ToLocalTime().ToString("HH:mm:ss"));
+                }
+                catch (Exception ex)
+                {
+                    Log.Write("Update", "Unerwarteter Fehler im Update-Thread: " + Log.Describe(ex));
+                    lock (_sync) { DateTime next = DateTime.UtcNow + RetryAfterFailure; if (next < _nextCheckUtc) _nextCheckUtc = next; }
+                }
+            }
+        }
+
+        // LoginPilot.exe /updatecheck: genau eine Pruefung samt Austausch, ohne Fenster, Mutex und Neustart
+        public static int RunHeadless()
+        {
+            Log.Write("Update", "Kopflos-Pruefung gestartet (v" + CurrentVersion + ", EXE: " + Application.ExecutablePath + ")");
+            int code;
+            try { string v; code = RunCheck(false, out v); }
+            catch (Exception ex) { Log.Write("Update", "Unerwarteter Fehler: " + Log.Describe(ex)); code = ExitCheckFailed; }
+            if (code == SkippedThisRun) code = ExitUpToDate;
+            Log.Write("Update", "Kopflos-Pruefung beendet, Exit-Code " + code);
+            return code;
+        }
+
+        static int RunCheck(bool guiMode, out string newVersion)
+        {
+            newVersion = null;
             // TLS 1.2 erzwingen (GitHub braucht das, .NET 4.0 default ist aelter)
-            ServicePointManager.SecurityProtocol =
-                (SecurityProtocolType)3072; // SecurityProtocolType.Tls12
+            try { ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; } catch { }
 
-            string remoteVersion;
-            using (var wc = new WebClient())
+            string baseUrl = GetBaseUrl();
+            string exePath = Application.ExecutablePath;
+            string exeDir = Path.GetDirectoryName(exePath);
+            string tmpPath = exePath + ".tmp";
+            string bakPath = exePath + ".bak";
+            TryDelete(tmpPath); // Reste frueherer Versuche
+
+            string versionText;
+            try { versionText = DownloadString(baseUrl + "version.txt"); }
+            catch (Exception ex)
             {
-                wc.Headers.Add("User-Agent", "LoginPilot/" + CurrentVersion);
-                // Timeout ueber eigenen WebRequest setzen
-                var req = (HttpWebRequest)WebRequest.Create(VersionUrl);
-                req.Timeout = TimeoutMs;
-                req.UserAgent = "LoginPilot/" + CurrentVersion;
-                using (var resp = req.GetResponse())
-                using (var sr = new StreamReader(resp.GetResponseStream()))
-                    remoteVersion = sr.ReadToEnd().Trim();
+                Log.Write("Update", "version.txt nicht abrufbar: " + Log.Describe(ex));
+                return ExitCheckFailed;
             }
 
-            if (string.IsNullOrEmpty(remoteVersion)) return;
-
-            // Versionsvergleich als float (3.1 < 3.2 etc.)
-            float remote, current;
-            if (!float.TryParse(remoteVersion, System.Globalization.NumberStyles.Any,
-                System.Globalization.CultureInfo.InvariantCulture, out remote)) return;
-            if (!float.TryParse(CurrentVersion, System.Globalization.NumberStyles.Any,
-                System.Globalization.CultureInfo.InvariantCulture, out current)) return;
-
-            if (remote <= current) return; // Kein Update noetig
-
-            // Neue EXE herunterladen
-            string exePath  = Application.ExecutablePath;
-            string bakPath  = exePath + ".bak";
-            string tmpPath  = exePath + ".tmp";
-
-            var req2 = (HttpWebRequest)WebRequest.Create(ExeUrl);
-            req2.Timeout = 60000; // 60s fuer den Download
-            req2.UserAgent = "LoginPilot/" + CurrentVersion;
-            using (var resp = req2.GetResponse())
-            using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write))
+            Version remote, current;
+            if (!TryParseVersion(versionText, out remote))
             {
-                var buf = new byte[81920];
-                var stream = resp.GetResponseStream();
-                int read;
-                while ((read = stream.Read(buf, 0, buf.Length)) > 0)
-                    fs.Write(buf, 0, read);
+                string shown = (versionText ?? "").Trim();
+                if (shown.Length > 20) shown = shown.Substring(0, 20) + "...";
+                Log.Write("Update", "version.txt ungueltig: '" + shown + "'");
+                return ExitCheckFailed;
+            }
+            TryParseVersion(CurrentVersion, out current);
+            newVersion = versionText.Trim();
+            if (!IsNewer(remote, current))
+            {
+                Log.Write("Update", "Aktuell (lokal " + CurrentVersion + ", Server " + newVersion + ")");
+                return ExitUpToDate;
+            }
+            Log.Write("Update", "Neue Version " + newVersion + " verfuegbar (lokal " + CurrentVersion + ")");
+
+            if (guiMode && _downloadAttempted)
+            {
+                Log.Write("Update", "Download wurde in diesem Programmlauf schon versucht, naechster Versuch beim naechsten Start");
+                return SkippedThisRun;
             }
 
-            // Sanity-Check: heruntergeladene Datei muss groesser als 100 KB sein
-            if (new FileInfo(tmpPath).Length < 100 * 1024)
+            if (!CanWriteDir(exeDir))
             {
-                try { File.Delete(tmpPath); } catch { }
+                Log.Write("Update", "Keine Schreibrechte im EXE-Ordner " + exeDir + ", Update nicht moeglich");
+                if (guiMode && !_writeHintShown)
+                {
+                    _writeHintShown = true;
+                    var h = Notify;
+                    if (h != null) h("Update auf Version " + newVersion + " konnte nicht installiert werden (keine Schreibrechte). Bitte IT informieren.");
+                }
+                return ExitNoWriteAccess;
+            }
+
+            string expected;
+            try { expected = ParseSha256(DownloadString(baseUrl + "LoginPilot.exe.sha256")); }
+            catch (Exception ex)
+            {
+                Log.Write("Update", "LoginPilot.exe.sha256 nicht abrufbar: " + Log.Describe(ex) + " - kein Austausch");
+                return ExitHashInvalid;
+            }
+            if (expected == null)
+            {
+                Log.Write("Update", "LoginPilot.exe.sha256 ungueltig (keine 64 Hex-Zeichen) - kein Austausch");
+                return ExitHashInvalid;
+            }
+
+            _downloadAttempted = true;
+            try
+            {
+                Log.Write("Update", "Lade LoginPilot.exe herunter");
+                DownloadFile(baseUrl + "LoginPilot.exe", tmpPath);
+            }
+            catch (Exception ex)
+            {
+                Log.Write("Update", "Download fehlgeschlagen: " + Log.Describe(ex));
+                TryDelete(tmpPath);
+                return ExitCheckFailed;
+            }
+
+            string actual = ComputeSha256(tmpPath);
+            if (actual != expected)
+            {
+                Log.Write("Update", "SHA-256 passt nicht (erwartet " + expected + ", erhalten " + actual + ") - kein Austausch");
+                TryDelete(tmpPath);
+                return ExitHashInvalid;
+            }
+            Log.Write("Update", "SHA-256 geprueft: " + actual);
+
+            try
+            {
+                if (File.Exists(bakPath)) File.Delete(bakPath);
+                File.Move(exePath, bakPath);
+            }
+            catch (Exception ex)
+            {
+                Log.Write("Update", "EXE konnte nicht nach .bak umbenannt werden: " + Log.Describe(ex));
+                TryDelete(tmpPath);
+                return ExitNoWriteAccess;
+            }
+            try { File.Move(tmpPath, exePath); }
+            catch (Exception ex)
+            {
+                Log.Write("Update", "Neue EXE konnte nicht eingesetzt werden: " + Log.Describe(ex));
+                try { File.Move(bakPath, exePath); Log.Write("Update", "Alte EXE aus .bak wiederhergestellt"); }
+                catch (Exception ex2) { Log.Write("Update", "Wiederherstellen aus .bak fehlgeschlagen: " + Log.Describe(ex2)); }
+                TryDelete(tmpPath);
+                return ExitNoWriteAccess;
+            }
+            Log.Write("Update", "Version " + newVersion + " installiert");
+            return ExitUpdated;
+        }
+
+        // ----- Abruf: zuerst System-Proxy mit Standard-Anmeldedaten, bei Fehler direkt -----
+        static HttpWebRequest NewRequest(string url, int timeoutMs, bool useProxy)
+        {
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.Timeout = timeoutMs;
+            req.ReadWriteTimeout = timeoutMs;
+            req.UserAgent = "LoginPilot/" + CurrentVersion;
+            req.Headers["Cache-Control"] = "no-cache";
+            if (useProxy)
+            {
+                IWebProxy p = WebRequest.GetSystemWebProxy();
+                p.Credentials = CredentialCache.DefaultCredentials;
+                req.Proxy = p;
+            }
+            else req.Proxy = null;
+            return req;
+        }
+
+        static void Fetch(string url, int timeoutMs, Action<Stream> consume)
+        {
+            try
+            {
+                using (var resp = NewRequest(url, timeoutMs, true).GetResponse())
+                using (var s = resp.GetResponseStream()) consume(s);
                 return;
             }
+            catch (Exception ex)
+            {
+                Log.Write("Update", "Abruf ueber System-Proxy fehlgeschlagen (" + Log.Describe(ex) + "), versuche direkt");
+            }
+            using (var resp = NewRequest(url, timeoutMs, false).GetResponse())
+            using (var s = resp.GetResponseStream()) consume(s);
+        }
 
-            // Altes .bak aufraemen, aktuelle EXE als .bak sichern, neue einsetzen
-            try { if (File.Exists(bakPath)) File.Delete(bakPath); } catch { }
-            File.Move(exePath, bakPath);
-            File.Move(tmpPath, exePath);
+        static string DownloadString(string url)
+        {
+            string result = null;
+            Fetch(url, SmallTimeoutMs, s => { using (var sr = new StreamReader(s)) result = sr.ReadToEnd(); });
+            return result;
+        }
 
-            // Neustart – neuer Prozess startet, dieser beendet sich
-            Process.Start(exePath);
-            Application.Exit();
+        static void DownloadFile(string url, string target)
+        {
+            Fetch(url, ExeTimeoutMs, s =>
+            {
+                using (var fs = new FileStream(target, FileMode.Create, FileAccess.Write))
+                {
+                    var buf = new byte[81920];
+                    int read;
+                    while ((read = s.Read(buf, 0, buf.Length)) > 0) fs.Write(buf, 0, read);
+                }
+            });
+        }
+
+        // ----- Reine Logik (auch im Selbsttest) -----
+        public static bool IsAllowedTestUrl(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return false;
+            if (!value.StartsWith("http://localhost:", StringComparison.OrdinalIgnoreCase)
+                && !value.StartsWith("http://127.0.0.1:", StringComparison.OrdinalIgnoreCase)) return false;
+            Uri u;
+            if (!Uri.TryCreate(value, UriKind.Absolute, out u)) return false;
+            if (u.Scheme != Uri.UriSchemeHttp || !string.IsNullOrEmpty(u.UserInfo)) return false;
+            return u.Host == "localhost" || u.Host == "127.0.0.1";
+        }
+
+        static string GetBaseUrl()
+        {
+            string v = Environment.GetEnvironmentVariable(TestUrlEnv);
+            if (string.IsNullOrEmpty(v)) return DefaultBaseUrl;
+            if (!IsAllowedTestUrl(v))
+            {
+                Log.Write("Update", "Testschalter " + TestUrlEnv + " ignoriert (nur http://localhost:<port> oder http://127.0.0.1:<port> erlaubt): " + v);
+                return DefaultBaseUrl;
+            }
+            if (!v.EndsWith("/")) v += "/";
+            Log.Write("Update", "Testschalter aktiv, Basisadresse " + v);
+            return v;
+        }
+
+        public static bool TryParseVersion(string s, out Version v)
+        {
+            v = null;
+            if (s == null) return false;
+            s = s.Trim();
+            if (s.Length == 0) return false;
+            foreach (char c in s) if (!(c >= '0' && c <= '9') && c != '.') return false;
+            Version raw;
+            if (!Version.TryParse(s, out raw)) return false;
+            // 3.5 und 3.5.0 gleich behandeln
+            v = new Version(raw.Major, raw.Minor, Math.Max(raw.Build, 0), Math.Max(raw.Revision, 0));
+            return true;
+        }
+
+        public static bool IsNewer(Version remote, Version current)
+        {
+            return remote != null && current != null && remote > current;
+        }
+
+        public static bool IsNewer(string remote, string current)
+        {
+            Version r, c;
+            return TryParseVersion(remote, out r) && TryParseVersion(current, out c) && IsNewer(r, c);
+        }
+
+        public static string ParseSha256(string text)
+        {
+            if (text == null) return null;
+            string t = text.Trim().TrimStart('\uFEFF').Trim();
+            int cut = t.IndexOfAny(new[] { ' ', '\t', '\r', '\n', '*' });
+            if (cut >= 0) t = t.Substring(0, cut);
+            if (t.Length != 64) return null;
+            foreach (char c in t)
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return null;
+            return t.ToLowerInvariant();
+        }
+
+        public static string ComputeSha256(string path)
+        {
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            using (var fs = File.OpenRead(path))
+                return BitConverter.ToString(sha.ComputeHash(fs)).Replace("-", "").ToLowerInvariant();
+        }
+
+        public static bool VerifyFileHash(string path, string expectedHashText)
+        {
+            try
+            {
+                string expected = ParseSha256(expectedHashText);
+                return expected != null && File.Exists(path) && ComputeSha256(path) == expected;
+            }
+            catch { return false; }
+        }
+
+        // Testdatei anlegen, umbenennen, loeschen
+        public static bool CanWriteDir(string dir)
+        {
+            string a = Path.Combine(dir, "LoginPilot.writetest.tmp");
+            string b = a + "2";
+            TryDelete(a); TryDelete(b);
+            try
+            {
+                File.WriteAllText(a, "x");
+                File.Move(a, b);
+                File.Delete(b);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Write("Update", "Schreibprobe fehlgeschlagen: " + Log.Describe(ex));
+                TryDelete(a); TryDelete(b);
+                return false;
+            }
+        }
+
+        static void TryDelete(string path)
+        {
+            try { if (File.Exists(path)) File.Delete(path); } catch { }
+        }
+    }
+
+    // ========== OPENVPN-PROFILSUCHE ==========
+    public static class VpnProfiles
+    {
+        // Profilname = Wert nach "connect" bzw. "--connect" in VpnArgs, Endung .ovpn optional
+        public static string ExtractProfileName(string vpnArgs)
+        {
+            var tokens = Tokenize(vpnArgs);
+            for (int i = 0; i < tokens.Count - 1; i++)
+            {
+                if (tokens[i].TrimStart('-', '/').ToLowerInvariant() != "connect") continue;
+                string name = NormalizeName(tokens[i + 1]);
+                return name.Length > 0 ? name : null;
+            }
+            return null;
+        }
+
+        public static string NormalizeName(string name)
+        {
+            string n = (name ?? "").Trim().Trim('"').Trim();
+            if (n.EndsWith(".ovpn", StringComparison.OrdinalIgnoreCase)) n = n.Substring(0, n.Length - 5);
+            return n;
+        }
+
+        static List<string> Tokenize(string s)
+        {
+            var list = new List<string>();
+            if (string.IsNullOrEmpty(s)) return list;
+            var cur = new System.Text.StringBuilder();
+            bool inQuote = false, has = false;
+            foreach (char c in s)
+            {
+                if (c == '"') { inQuote = !inQuote; has = true; continue; }
+                if (!inQuote && char.IsWhiteSpace(c))
+                {
+                    if (has) { list.Add(cur.ToString()); cur.Length = 0; has = false; }
+                    continue;
+                }
+                cur.Append(c); has = true;
+            }
+            if (has) list.Add(cur.ToString());
+            return list;
+        }
+
+        // Globaler Ordner (HKLM config_dir, sonst <Installationsordner>\config) und Benutzerordner
+        public static List<string> GetSearchDirs(string vpnCommand)
+        {
+            var dirs = new List<string>();
+            string global = ReadRegValue(Registry.LocalMachine, @"SOFTWARE\OpenVPN", "config_dir");
+            if (string.IsNullOrEmpty(global) && !string.IsNullOrEmpty(vpnCommand))
+            {
+                try
+                {
+                    string binDir = Path.GetDirectoryName(vpnCommand);
+                    if (!string.IsNullOrEmpty(binDir))
+                    {
+                        string install = string.Equals(Path.GetFileName(binDir), "bin", StringComparison.OrdinalIgnoreCase)
+                            ? Path.GetDirectoryName(binDir) : binDir;
+                        if (!string.IsNullOrEmpty(install)) global = Path.Combine(install, "config");
+                    }
+                }
+                catch { }
+            }
+            string user = ReadRegValue(Registry.CurrentUser, @"Software\OpenVPN-GUI", "config_dir");
+            if (string.IsNullOrEmpty(user))
+                user = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), @"OpenVPN\config");
+            AddDir(dirs, global);
+            AddDir(dirs, user);
+            return dirs;
+        }
+
+        static void AddDir(List<string> dirs, string d)
+        {
+            if (string.IsNullOrEmpty(d)) return;
+            d = Environment.ExpandEnvironmentVariables(d).TrimEnd('\\', '/');
+            foreach (var x in dirs) if (string.Equals(x, d, StringComparison.OrdinalIgnoreCase)) return;
+            dirs.Add(d);
+        }
+
+        static string ReadRegValue(RegistryKey root, string sub, string name)
+        {
+            try
+            {
+                using (var k = root.OpenSubKey(sub, false))
+                {
+                    if (k == null) return null;
+                    var v = k.GetValue(name);
+                    return v != null ? v.ToString() : null;
+                }
+            }
+            catch { return null; }
+        }
+
+        // Alle <name>.ovpn in den Ordnern samt Unterordnern (Gross-/Kleinschreibung egal)
+        public static List<string> FindProfiles(string name, IEnumerable<string> dirs)
+        {
+            var hits = new List<string>();
+            string wanted = NormalizeName(name);
+            foreach (var d in dirs) Collect(d, wanted, hits, 0);
+            return hits;
+        }
+
+        static void Collect(string dir, string wanted, List<string> hits, int depth)
+        {
+            if (depth > 10 || !Directory.Exists(dir)) return;
+            try
+            {
+                foreach (var f in Directory.GetFiles(dir))
+                {
+                    if (!string.Equals(Path.GetExtension(f), ".ovpn", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!string.Equals(Path.GetFileNameWithoutExtension(f), wanted, StringComparison.OrdinalIgnoreCase)) continue;
+                    bool dup = false;
+                    foreach (var h in hits) if (string.Equals(h, f, StringComparison.OrdinalIgnoreCase)) dup = true;
+                    if (!dup) hits.Add(f);
+                }
+                foreach (var sub in Directory.GetDirectories(dir)) Collect(sub, wanted, hits, depth + 1);
+            }
+            catch (Exception ex) { Log.Write("Verbindung", "Ordner nicht lesbar: " + dir + " (" + Log.Describe(ex) + ")"); }
+        }
+    }
+
+    // ========== SELBSTTEST (LoginPilot.exe /selftest) ==========
+    // Prueft ohne Netz und ohne Fenster die reine Logik mit erfundenen Daten.
+    public static class SelfTest
+    {
+        static System.Text.StringBuilder _out;
+        static int _fail, _total;
+
+        static void Check(string name, bool ok)
+        {
+            _total++;
+            if (!ok) _fail++;
+            _out.AppendLine((ok ? "OK      " : "FEHLER  ") + name);
+        }
+
+        public static int Run()
+        {
+            _out = new System.Text.StringBuilder();
+            _fail = 0; _total = 0;
+            string root = Path.Combine(Path.GetTempPath(), "loginpilot-selftest-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                Directory.CreateDirectory(root);
+                Log.SetPath(Path.Combine(root, "selftest.log"));
+                _out.AppendLine("LoginPilot " + AutoUpdater.CurrentVersion + " Selbsttest " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+
+                // Versionsvergleich
+                Check("Version 3.10 > 3.9", AutoUpdater.IsNewer("3.10", "3.9"));
+                Check("Version 3.9 nicht > 3.10", !AutoUpdater.IsNewer("3.9", "3.10"));
+                Check("Version 3.5 > 3.4", AutoUpdater.IsNewer("3.5", "3.4"));
+                Check("Version 3.5 nicht > 3.5", !AutoUpdater.IsNewer("3.5", "3.5"));
+                Check("Version 3.5.1 > 3.5", AutoUpdater.IsNewer("3.5.1", "3.5"));
+                Check("Version 3.5.0 nicht > 3.5", !AutoUpdater.IsNewer("3.5.0", "3.5"));
+                Check("Version 4.0 > 3.99", AutoUpdater.IsNewer("4.0", "3.99"));
+                Check("Version mit Zeilenumbruch '3.6\\r\\n' > 3.5", AutoUpdater.IsNewer("3.6\r\n", "3.5"));
+                Version v;
+                Check("Version 'abc' ungueltig", !AutoUpdater.TryParseVersion("abc", out v));
+                Check("Version '3,5' ungueltig", !AutoUpdater.TryParseVersion("3,5", out v));
+                Check("Version leer ungueltig", !AutoUpdater.TryParseVersion("", out v));
+                Check("Version '3' ungueltig", !AutoUpdater.TryParseVersion("3", out v));
+                Check("Ungueltige Server-Version loest kein Update aus", !AutoUpdater.IsNewer("<html>", "3.5"));
+
+                // SHA-256
+                string f = Path.Combine(root, "probe.bin");
+                File.WriteAllBytes(f, System.Text.Encoding.ASCII.GetBytes("abc"));
+                const string abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+                Check("SHA-256 passt", AutoUpdater.VerifyFileHash(f, abc + "\r\n"));
+                Check("SHA-256 passt (Grossbuchstaben, mit Dateiname)", AutoUpdater.VerifyFileHash(f, abc.ToUpperInvariant() + " *LoginPilot.exe"));
+                Check("SHA-256 passt nicht", !AutoUpdater.VerifyFileHash(f, abc.Substring(0, 63) + "0"));
+                Check("SHA-256 Datei fehlt", !AutoUpdater.VerifyFileHash(Path.Combine(root, "fehlt.bin"), abc));
+                Check("SHA-256 Hash-Text ungueltig", !AutoUpdater.VerifyFileHash(f, "kein-hash"));
+                Check("SHA-256 Hash-Text leer", AutoUpdater.ParseSha256("") == null);
+
+                // Profilsuche
+                string g = Path.Combine(root, "global"), u = Path.Combine(root, "user");
+                Directory.CreateDirectory(Path.Combine(g, "sub"));
+                Directory.CreateDirectory(Path.Combine(u, "tief", "er"));
+                File.WriteAllText(Path.Combine(g, "sub", "Alpha.ovpn"), "x");
+                File.WriteAllText(Path.Combine(g, "alpha.txt"), "x");
+                File.WriteAllText(Path.Combine(u, "beta.OVPN"), "x");
+                File.WriteAllText(Path.Combine(g, "Gamma.ovpn"), "x");
+                File.WriteAllText(Path.Combine(u, "tief", "er", "gamma.ovpn"), "x");
+                var dirs = new List<string> { g, u, Path.Combine(root, "gibtsnicht") };
+                Check("Profilsuche 0 Treffer", VpnProfiles.FindProfiles("Delta", dirs).Count == 0);
+                Check("Profilsuche 1 Treffer im Unterordner, andere Schreibweise", VpnProfiles.FindProfiles("ALPHA", dirs).Count == 1);
+                Check("Profilsuche Endung optional", VpnProfiles.FindProfiles("Beta.ovpn", dirs).Count == 1);
+                Check("Profilsuche 2 Treffer (global + Benutzer)", VpnProfiles.FindProfiles("gamma", dirs).Count == 2);
+                Check("Profilsuche zaehlt .txt nicht", VpnProfiles.FindProfiles("alpha", new List<string> { g }).Count == 1);
+
+                // Profilname aus VpnArgs
+                Check("VpnArgs '--command connect Buero'", VpnProfiles.ExtractProfileName("--command connect Buero") == "Buero");
+                Check("VpnArgs '--connect \"Home Office.ovpn\"'", VpnProfiles.ExtractProfileName("--connect \"Home Office.ovpn\"") == "Home Office");
+                Check("VpnArgs '--silent_connection 1 --connect test.OVPN'", VpnProfiles.ExtractProfileName("--silent_connection 1 --connect test.OVPN") == "test");
+                Check("VpnArgs '--command connect' ohne Namen", VpnProfiles.ExtractProfileName("--command connect") == null);
+                Check("VpnArgs '--command disconnect_all'", VpnProfiles.ExtractProfileName("--command disconnect_all") == null);
+                Check("VpnArgs leer", VpnProfiles.ExtractProfileName("") == null);
+
+                // Testschalter
+                Check("Testschalter http://localhost:8080/ erlaubt", AutoUpdater.IsAllowedTestUrl("http://localhost:8080/"));
+                Check("Testschalter http://127.0.0.1:9000 erlaubt", AutoUpdater.IsAllowedTestUrl("http://127.0.0.1:9000"));
+                Check("Testschalter https://example.com/ abgelehnt", !AutoUpdater.IsAllowedTestUrl("https://example.com/"));
+                Check("Testschalter http://localhost.example.com/ abgelehnt", !AutoUpdater.IsAllowedTestUrl("http://localhost.example.com/"));
+                Check("Testschalter http://localhost:80@example.com/ abgelehnt", !AutoUpdater.IsAllowedTestUrl("http://localhost:80@example.com/"));
+                Check("Testschalter leer abgelehnt", !AutoUpdater.IsAllowedTestUrl(""));
+
+                // Protokoll-Rotation
+                string lp = Path.Combine(root, "rot.log");
+                Log.SetPath(lp);
+                File.WriteAllText(lp, new string('a', (int)Log.MaxBytes + 10));
+                Log.Write("Test", "nach Rotation");
+                Check("Rotation: .1 angelegt", File.Exists(lp + ".1") && new FileInfo(lp + ".1").Length > Log.MaxBytes);
+                Check("Rotation: neue Datei klein und mit Zeilenform", File.Exists(lp) && new FileInfo(lp).Length < 200
+                    && System.Text.RegularExpressions.Regex.IsMatch(File.ReadAllText(lp), @"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \[Test\] nach Rotation"));
+                File.WriteAllText(lp, new string('b', (int)Log.MaxBytes + 10));
+                Log.Write("Test", "zweite Rotation");
+                Check("Rotation: nur eine Generation (.1 ersetzt, kein .2)", File.ReadAllText(lp + ".1").StartsWith("b") && !File.Exists(lp + ".2"));
+                Log.Write("Test", "klein");
+                Check("Keine Rotation unter 300 KB", File.ReadAllText(lp).Contains("zweite Rotation"));
+            }
+            catch (Exception ex)
+            {
+                _total++; _fail++;
+                _out.AppendLine("FEHLER  Unerwartete Ausnahme: " + Log.Describe(ex));
+            }
+            finally
+            {
+                try { Directory.Delete(root, true); } catch { }
+            }
+            _out.AppendLine("Faelle: " + _total + ", Fehler: " + _fail);
+            try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "loginpilot-selftest.txt"), _out.ToString()); } catch { }
+            return _fail;
         }
     }
 
@@ -710,7 +1319,10 @@ namespace LoginPilot
         TextBox _txtName, _txtServer, _txtPort, _txtExceptions, _txtSubnet, _txtRdp, _txtLogo, _txtRdpOff, _txtVpnCmd, _txtVpnArgs;
         Panel _pnlRdpSettings, _pnlVpnSettings;
 
-        public MainForm(bool configMode)
+        readonly System.Threading.SynchronizationContext _ui;
+        Timer _restartTimer;
+
+        public MainForm(bool configMode, bool justUpdated)
         {
             _cfg = AppConfig.Load();
             _isFirstStart = _cfg.IsFirstStart;
@@ -734,6 +1346,122 @@ namespace LoginPilot
                 ApplyLastMode();
                 if (_cfg.StartMinimized) { WindowState = FormWindowState.Minimized; ShowInTaskbar = false; Visible = false; }
             }
+
+            // Updater meldet sich aus dem Hintergrund-Thread -> auf den UI-Thread umleiten
+            _ui = System.Threading.SynchronizationContext.Current;
+            AutoUpdater.Installed += v => PostUi(() => OnUpdateInstalled(v));
+            AutoUpdater.Notify += text => PostUi(() => ShowTrayInfo(text));
+            if (justUpdated)
+            {
+                var hint = new Timer { Interval = 3000 };
+                hint.Tick += (s, e) => { hint.Stop(); hint.Dispose(); ShowTrayInfo("LoginPilot wurde auf Version " + AutoUpdater.CurrentVersion + " aktualisiert"); };
+                hint.Start();
+            }
+        }
+
+        void PostUi(Action a)
+        {
+            try { if (_ui != null) _ui.Post(_ => { try { a(); } catch (Exception ex) { Log.Write("Fehler", Log.Describe(ex)); } }, null); }
+            catch { }
+        }
+
+        void ShowTrayInfo(string text)
+        {
+            Log.Write("Hinweis", text);
+            try { _tray.ShowBalloonTip(8000, "LoginPilot", text, ToolTipIcon.Info); } catch { }
+        }
+
+        // ========== NEUSTART NACH UPDATE ==========
+        // Nie waehrend eines laufenden Verbindungsvorgangs, sondern danach.
+        void OnUpdateInstalled(string version)
+        {
+            Log.Write("Update", "Neustart auf Version " + version + " vorgemerkt");
+            TryRestartForUpdate();
+        }
+
+        void TryRestartForUpdate()
+        {
+            if (_rdpLaunchInProgress)
+            {
+                if (_restartTimer == null)
+                {
+                    Log.Write("Update", "Verbindungsvorgang laeuft, Neustart wird verschoben");
+                    _restartTimer = new Timer { Interval = 2000 };
+                    _restartTimer.Tick += (s, e) => TryRestartForUpdate();
+                    _restartTimer.Start();
+                }
+                return;
+            }
+            if (_restartTimer != null) { _restartTimer.Stop(); _restartTimer.Dispose(); _restartTimer = null; }
+            try { System.Diagnostics.Process.Start(Application.ExecutablePath, "/updated"); }
+            catch (Exception ex) { Log.Write("Update", "Neustart fehlgeschlagen: " + Log.Describe(ex)); return; }
+            Log.Write("Update", "Neue Instanz gestartet, alte Instanz beendet sich");
+            try { _tray.Visible = false; _tray.Dispose(); } catch { }
+            Program.ReleaseSingleInstance();
+            Application.Exit();
+        }
+
+        void OpenLog()
+        {
+            Log.Write("Start", "Protokoll geoeffnet");
+            try { System.Diagnostics.Process.Start("notepad.exe", "\"" + Log.FilePath + "\""); }
+            catch (Exception ex) { MessageBox.Show("Protokoll konnte nicht ge\u00f6ffnet werden:\n" + Log.FilePath + "\n\n" + ex.Message, "LoginPilot", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        }
+
+        // Meldungsfenster im Vordergrund mit zwei Knoepfen. true = erster Knopf.
+        bool AskChoice(string title, string text, string yesText, string noText)
+        {
+            using (var f = new Form())
+            {
+                f.Text = title;
+                f.FormBorderStyle = FormBorderStyle.FixedDialog;
+                f.MaximizeBox = false; f.MinimizeBox = false;
+                f.StartPosition = FormStartPosition.CenterScreen;
+                f.TopMost = true;
+                f.ShowInTaskbar = true;
+                f.Font = new Font("Segoe UI", 9.5f);
+                if (_appIcon != null) f.Icon = _appIcon;
+                var lbl = new Label { Text = text, AutoSize = true, MaximumSize = new Size(520, 0), Location = new Point(16, 16) };
+                f.Controls.Add(lbl);
+                Size ps = lbl.PreferredSize;
+                int y = 16 + ps.Height + 20;
+                var no = new Button { Text = noText, DialogResult = DialogResult.Cancel, AutoSize = true, MinimumSize = new Size(110, 30) };
+                var yes = new Button { Text = yesText, DialogResult = DialogResult.OK, AutoSize = true, MinimumSize = new Size(140, 30) };
+                f.Controls.Add(no); f.Controls.Add(yes);
+                int width = Math.Max(ps.Width + 32, 340);
+                no.Location = new Point(width - 16 - no.PreferredSize.Width, y);
+                yes.Location = new Point(no.Left - 10 - yes.PreferredSize.Width, y);
+                f.ClientSize = new Size(width, y + 30 + 16);
+                f.CancelButton = no;
+                f.Shown += (s, e) => { f.Activate(); SetForegroundWindow(f.Handle); };
+                return f.ShowDialog() == DialogResult.OK;
+            }
+        }
+
+        // Prueft vor dem Connect, ob das OpenVPN-Profil genau einmal vorhanden ist. false = nicht verbinden.
+        bool CheckVpnProfile(int gen)
+        {
+            string name = VpnProfiles.ExtractProfileName(_cfg.VpnArgs);
+            if (name == null) { Log.Write("Verbindung", "Profilname aus VPN-Argumenten nicht ermittelbar, Profilpruefung uebersprungen"); return true; }
+            var dirs = VpnProfiles.GetSearchDirs(_cfg.VpnCommand);
+            var hits = VpnProfiles.FindProfiles(name, dirs);
+            Log.Write("Verbindung", "Profilpruefung '" + name + "': " + hits.Count + " Treffer in " + string.Join("; ", dirs.ToArray())
+                + (hits.Count > 0 ? " -> " + string.Join("; ", hits.ToArray()) : ""));
+            if (hits.Count == 1) return true;
+            if (hits.Count == 0)
+            {
+                EndLaunch("\u26a0 OpenVPN-Profil nicht gefunden", Clr.Red, false);
+                MessageBox.Show("OpenVPN-Profil \u201e" + name + "\u201c wurde nicht gefunden.\n\nDurchsuchte Ordner (mit Unterordnern):\n" + string.Join("\n", dirs.ToArray()),
+                    "Arbeitsplatz", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+            bool go = AskChoice("OpenVPN-Profil",
+                "Das Profil ist mehrfach vorhanden. OpenVPN verwendet dann nur eines oder keines. Bitte IT informieren.\n\nGefundene Dateien:\n"
+                + string.Join("\n", hits.ToArray()), "Trotzdem verbinden", "Abbrechen");
+            if (gen != _launchGen) return false;
+            if (!go) { EndLaunch("OpenVPN-Profil mehrfach vorhanden \u2013 abgebrochen", Clr.T2, false); return false; }
+            Log.Write("Verbindung", "Profil mehrfach vorhanden, Nutzer verbindet trotzdem");
+            return true;
         }
 
         Label AL(string text, Font font, Color color, int x, int y)
@@ -859,9 +1587,10 @@ namespace LoginPilot
             if (_cfg.EnableRdp)
             {
                 _trayMenu.Items.Add(new ToolStripSeparator());
-                _trayMenu.Items.Add("\u25b6  Arbeitsplatz starten", null, (s, e) => LaunchWts());
+                _trayMenu.Items.Add("\u25b6  Arbeitsplatz starten", null, (s, e) => { Log.Write("Verbindung", "Tray: Arbeitsplatz starten"); LaunchWts(); });
             }
             _trayMenu.Items.Add(new ToolStripSeparator());
+            _trayMenu.Items.Add("Protokoll \u00f6ffnen", null, (s, e) => OpenLog());
             _trayMenu.Items.Add("\u00d6ffnen", null, (s, e) => { Show(); ShowInTaskbar = true; WindowState = FormWindowState.Normal; BringToFront(); });
             _trayMenu.Items.Add("Beenden", null, (s, e) => { _tray.Visible = false; Application.Exit(); });
         }
@@ -990,7 +1719,7 @@ namespace LoginPilot
             };
             _mainPage.Controls.Add(btnTheme);
 
-            var ver = AL("v3.4", new Font("Segoe UI", 7.5f), Clr.Brd, CW, 800);
+            var ver = AL("v" + AutoUpdater.CurrentVersion,new Font("Segoe UI", 7.5f), Clr.Brd, CW, 800);
             ver.Tag = "version";
             _mainPage.Controls.Add(ver);
         }
@@ -1208,6 +1937,7 @@ namespace LoginPilot
             StopAllLaunchTimers();
             _rdpLaunchInProgress = false;
             _vpnWaitActive = false;
+            Log.Write("Verbindung", "Vorgang beendet" + (info != null ? ": " + info : ""));
             ResetWtsButton();
             if (info == null) { UpdateWtsInfo(); return; }
             _lblWtsInfo.ForeColor = infoColor;
@@ -1236,9 +1966,11 @@ namespace LoginPilot
         {
             if (_vpnWaitActive)
             {
+                Log.Write("Verbindung", "Klick: Abbrechen");
                 EndLaunch("VPN-Verbindung abgebrochen", Clr.T2, false);
                 return;
             }
+            Log.Write("Verbindung", "Klick: Arbeitsplatz starten");
             LaunchWts();
         }
 
@@ -1256,9 +1988,10 @@ namespace LoginPilot
         {
             if (!_cfg.EnableRdp) return;
             // Laeuft bereits ein Vorgang (z.B. Start aus dem Tray): Fenster mit Status zeigen statt still nichts zu tun
-            if (_rdpLaunchInProgress) { ShowMainWindow(); return; }
+            if (_rdpLaunchInProgress) { Log.Write("Verbindung", "Vorgang laeuft bereits, Fenster gezeigt"); ShowMainWindow(); return; }
 
             _rdpLaunchInProgress = true;
+            Log.Write("Verbindung", "Verbindungsvorgang gestartet");
             _wtsConnected = false; // Bei jedem Klick zuruecksetzen
             _startupAutoLaunchDone = true; // nach dem ersten Start (auch manuell) nie mehr automatisch verbinden
             int gen = ++_launchGen;
@@ -1285,6 +2018,7 @@ namespace LoginPilot
             // Im Buero (Proxy EIN) -> direkt RDP starten
             if (ProxyManager.IsEnabled())
             {
+                Log.Write("Verbindung", "Proxy aktiv (Buero), RDP direkt");
                 DoLaunchRdp(rdpFile, found);
                 return;
             }
@@ -1295,6 +2029,7 @@ namespace LoginPilot
                 if (NetDetect.IsVpnConnected())
                 {
                     // VPN steht bereits -> Tunnel-Check, dann RDP
+                    Log.Write("Verbindung", "VPN bereits verbunden, Tunnelpruefung");
                     SetWtsBusy("\u23f3  PR\u00dcFE TUNNEL...", "\u23f3 VPN verbunden \u2013 pr\u00fcfe Tunnel...");
                     StartTunnelCheck(rdpFile, found, gen);
                     return;
@@ -1310,12 +2045,14 @@ namespace LoginPilot
                             "Arbeitsplatz", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                         return;
                     }
+                    if (!CheckVpnProfile(gen)) return;
                     StartVpnAndWait(rdpFile, found, gen);
                     return;
                 }
             }
 
             // Fallback: Kein VPN konfiguriert oder VPN deaktiviert -> direkt RDP
+            Log.Write("Verbindung", "Kein VPN konfiguriert, RDP direkt");
             DoLaunchRdp(rdpFile, found);
         }
 
@@ -1347,11 +2084,13 @@ namespace LoginPilot
             if (IsVpnGuiRunning())
             {
                 // GUI laeuft schon -> direkt connect senden
+                Log.Write("Verbindung", "OpenVPN-GUI laeuft bereits");
                 SendVpnConnect(gen, true);
             }
             else
             {
                 // GUI erst starten
+                Log.Write("Verbindung", "OpenVPN-GUI wird gestartet");
                 try
                 {
                     var psi = new System.Diagnostics.ProcessStartInfo();
@@ -1404,6 +2143,7 @@ namespace LoginPilot
                 elapsed += 2;
                 if (NetDetect.IsVpnConnected())
                 {
+                    Log.Write("Verbindung", "VPN-Verbindung erkannt nach " + elapsed + " s");
                     StopAllLaunchTimers(); // auch das Nach-vorne-holen von OpenVPN beenden
                     _vpnWaitActive = false;
                     SetWtsBusy("\u23f3  PR\u00dcFE TUNNEL...", "\u23f3 VPN verbunden \u2013 pr\u00fcfe Tunnel-Stabilit\u00e4t...");
@@ -1462,9 +2202,11 @@ namespace LoginPilot
                 psi.Arguments = _cfg.VpnArgs;
                 psi.UseShellExecute = true;
                 System.Diagnostics.Process.Start(psi);
+                Log.Write("Verbindung", "Connect-Befehl gesendet" + (allowRetry ? "" : " (Wiederholung)"));
             }
-            catch
+            catch (Exception ex)
             {
+                Log.Write("Verbindung", "Connect-Befehl fehlgeschlagen: " + Log.Describe(ex));
                 EndLaunch("\u26a0 VPN-Verbindungsbefehl fehlgeschlagen", Clr.Red, true);
                 return;
             }
@@ -1508,6 +2250,8 @@ namespace LoginPilot
                     successCount++;
                 else
                     successCount = 0;
+                Log.Write("Verbindung", "Tunnelpruefung " + stabilityChecks + "/" + maxStabilityChecks + ": "
+                    + (string.IsNullOrEmpty(rdpHost) ? "kein Host in RDP-Datei, Wartezeit" : "Host " + rdpHost + ":3389 " + (reachable ? "erreichbar" : "nicht erreichbar")));
 
                 if (successCount >= requiredSuccesses)
                 {
@@ -1525,7 +2269,20 @@ namespace LoginPilot
                 }
                 else if (stabilityChecks >= maxStabilityChecks)
                 {
-                    EndLaunch("\u26a0 VPN steht, aber RDP-Host nicht erreichbar", Clr.Red, true);
+                    Log.Write("Verbindung", "Tunnelpruefung fehlgeschlagen: Host " + rdpHost + " nach " + stabilityChecks + " Versuchen nicht erreichbar");
+                    EndLaunch("\u26a0 VPN steht, aber RDP-Host nicht erreichbar", Clr.Red, false);
+                    bool go = AskChoice("Arbeitsplatz",
+                        "Das VPN ist verbunden, aber der Arbeitsplatz-Rechner antwortet nicht (" + stabilityChecks + " Versuche).\n\n"
+                        + "M\u00f6gliche Ursachen: Der VPN-Tunnel ist noch nicht vollst\u00e4ndig aufgebaut, das falsche VPN-Profil wurde verwendet "
+                        + "oder der Arbeitsplatz-Rechner ist ausgeschaltet.\n\n"
+                        + "\u201eTrotzdem verbinden\u201c startet die Remotedesktop-Verbindung ohne weitere Pr\u00fcfung.",
+                        "Trotzdem verbinden", "Schlie\u00dfen");
+                    if (go && !_rdpLaunchInProgress)
+                    {
+                        Log.Write("Verbindung", "Nutzer: Trotzdem verbinden");
+                        DoLaunchRdp(rdpFile, foundPath);
+                    }
+                    else Log.Write("Verbindung", "Nutzer: Schliessen");
                 }
                 else
                 {
@@ -1544,10 +2301,12 @@ namespace LoginPilot
             _vpnWaitActive = false;
             if (RdpLauncher.Launch(rdpFile))
             {
+                Log.Write("Verbindung", "RDP gestartet: " + Path.GetFileName(foundPath));
                 SetWtsConnected(rdpFile);
             }
             else
             {
+                Log.Write("Verbindung", "RDP-Start fehlgeschlagen: " + Path.GetFileName(foundPath));
                 ResetWtsButton();
                 MessageBox.Show("Fehler beim Starten von:\n" + foundPath, "Arbeitsplatz", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
@@ -1952,6 +2711,7 @@ namespace LoginPilot
         void OnNetworkChanged(object sender, EventArgs e)
         {
             // Debounce: Netzwerk\u00e4nderungen kommen oft in Salven (2-5 Events hintereinander)
+            AutoUpdater.RequestSoon("Netzwerkwechsel");
             if (InvokeRequired) { try { Invoke(new Action(() => ScheduleNetworkRecheck())); } catch { } return; }
             ScheduleNetworkRecheck();
         }
@@ -1971,6 +2731,8 @@ namespace LoginPilot
         void HandleResume()
         {
             // Hard-Reset: laufenden Verbindungsvorgang inkl. aller Timer beenden, Button zuruecksetzen
+            Log.Write("System", "Resume aus Standby/Ruhezustand");
+            AutoUpdater.RequestSoon("Resume");
             _wtsConnected = false;
             _startupAutoLaunchDone = true; // nach Standby/Hibernate nie automatisch verbinden
             EndLaunch(null, Clr.T2, false);
@@ -2006,6 +2768,7 @@ namespace LoginPilot
             string currentHash = GetNetworkHash();
             if (currentHash == _lastNetworkHash) return;
             _lastNetworkHash = currentHash;
+            Log.Write("System", "Netzwerkwechsel erkannt, Standort wird neu ermittelt");
 
             // Neuerkennung durchf\u00fchren
             _wtsConnected = false;
@@ -2027,6 +2790,7 @@ namespace LoginPilot
                 autoLaunchTimer.Tick += (s, ev) =>
                 {
                     autoLaunchTimer.Stop(); autoLaunchTimer.Dispose();
+                    Log.Write("Verbindung", "Automatischer Start nach Programmstart");
                     LaunchWts();
                 };
                 autoLaunchTimer.Start();
@@ -2074,23 +2838,51 @@ namespace LoginPilot
     static class Program
     {
         static System.Threading.Mutex _mutex;
-        [STAThread]
-        static void Main(string[] args)
+
+        // Vor dem Neustart nach einem Update (auf dem UI-Thread = Besitzer-Thread aufrufen)
+        public static void ReleaseSingleInstance()
         {
+            try { if (_mutex != null) { _mutex.ReleaseMutex(); _mutex.Dispose(); _mutex = null; } } catch { }
+        }
+
+        [STAThread]
+        static int Main(string[] args)
+        {
+            bool cfg = false, updated = false;
+            foreach (string a in args)
+            {
+                string l = a.ToLowerInvariant();
+                if (l == "/updatecheck") return AutoUpdater.RunHeadless(); // ohne Fenster, Mutex, Neustart
+                if (l == "/selftest") return SelfTest.Run();
+                if (l == "/k" || l == "-k") cfg = true;
+                if (l == "/updated") updated = true;
+            }
+
             // Prozess-Prioritaet erhoehen: LoginPilot startet schneller als normale
             // Hintergrundprozesse beim Windows-Login
             try { System.Diagnostics.Process.GetCurrentProcess().PriorityClass =
                 System.Diagnostics.ProcessPriorityClass.AboveNormal; } catch { }
 
-            bool created; _mutex = new System.Threading.Mutex(true, "LoginPilot_SingleInstance", out created);
-            if (!created) { MessageBox.Show("LoginPilot l\u00e4uft bereits.\n\nDoppelklick auf das Tray-Icon zum \u00d6ffnen.", "LoginPilot", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            Log.Write("Start", "LoginPilot v" + AutoUpdater.CurrentVersion + " gestartet, EXE: " + Application.ExecutablePath + (updated ? " (nach Update)" : ""));
+
+            // Nach einem Update bis zu 15 s warten, bis die alte Instanz den Mutex freigibt
+            _mutex = new System.Threading.Mutex(false, "LoginPilot_SingleInstance");
+            bool owned;
+            try { owned = _mutex.WaitOne(updated ? 15000 : 0, false); }
+            catch (System.Threading.AbandonedMutexException) { owned = true; }
+            if (!owned)
+            {
+                Log.Write("Start", "Andere Instanz laeuft bereits, Start abgebrochen");
+                MessageBox.Show("LoginPilot läuft bereits.\n\nDoppelklick auf das Tray-Icon zum Öffnen.", "LoginPilot", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return 0;
+            }
             Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
-            bool cfg = false; foreach (string a in args) if (a.ToLower() == "/k" || a.ToLower() == "-k") cfg = true;
 
-            // Auto-Update im Hintergrund pruefen – blockiert den Start nicht
-            AutoUpdater.CheckAndUpdateAsync();
-
-            Application.Run(new MainForm(cfg));
+            var form = new MainForm(cfg, updated);
+            // Auto-Update im Hintergrund pruefen - blockiert den Start nicht
+            AutoUpdater.StartBackground();
+            Application.Run(form);
+            return 0;
         }
     }
 }

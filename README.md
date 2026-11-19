@@ -12,9 +12,11 @@ Lightweight Windows tray tool for automatic proxy switching, VPN launch and RDP 
 - **Proxy management** – enables/disables Windows proxy via registry (HKCU), no admin rights required
 - **VPN launch** – starts OpenVPN GUI and waits for connection before launching RDP
 - **RDP launch** – starts the correct `.rdp` file depending on location (office vs. home office)
-- **Tunnel check** – verifies RDP host reachability on port 3389 before connecting
+- **VPN profile check** – before connecting, verifies that the OpenVPN profile exists exactly once (global and user config folders, including subfolders)
+- **Tunnel check** – verifies RDP host reachability on port 3389 before connecting; if it fails, a dialog offers "connect anyway"
 - **Tray icon** – color-coded status indicator (green = office, blue = VPN, orange = no connection)
-- **Auto-update** – checks for new version on startup and updates silently
+- **Auto-update** – checks for new versions in the background, verifies the download (SHA-256) and updates silently
+- **Log file** – `loginpilot.log` records connection steps and update checks for troubleshooting
 - **Autostart** – installs as Scheduled Task (starts earlier than regular startup entries)
 - **Dark/Light theme**
 - **Portable** – no installation, config file sits next to the EXE
@@ -79,16 +81,40 @@ LoginPilot searches for `.rdp` files in the following order:
 
 ## Auto-Update
 
-LoginPilot checks for updates on every start by comparing the local version against `version.txt` in this repository.
+LoginPilot compares its own version against `version.txt` in this repository (`System.Version` comparison, so `3.10` is newer than `3.9`).
 
-- **Silent** – no popups, no user interaction required
-- **Safe** – old EXE is renamed to `.bak` before replacing
-- **Offline-tolerant** – if GitHub is unreachable, the check is skipped silently
+- **Schedule** – first check 20 s after start; every 4 h after a successful check, every 5 min after a failed one; additionally 30 s after resume from standby or a network change
+- **Proxy-aware** – downloads via the system proxy with default credentials first, then directly without proxy
+- **Verified** – the new EXE is only installed if its SHA-256 matches `LoginPilot.exe.sha256`; a missing or wrong hash means no replacement
+- **Safe** – write access to the EXE folder is tested first; the old EXE is kept as `.bak` and restored if the swap fails; at most one download attempt per run
+- **No interruption** – the restart waits until a running connection attempt has finished; the new instance shows a tray notice
+- **Silent** – no popups; only a tray notice if the update cannot be installed for lack of write access
 
 To publish a new version:
 1. Compile the new EXE
-2. Update `version.txt` (e.g. `3.2`)
-3. Push both files to the repo – all clients update on next start
+2. Create `LoginPilot.exe.sha256` containing only the 64 lowercase hex characters of the EXE's SHA-256 (e.g. `certutil -hashfile LoginPilot.exe SHA256`)
+3. Push EXE and hash file first, then update `version.txt` (plain number, e.g. `3.5`) – clients update on their next check
+
+Command-line options for testing and administration:
+
+| Option | Description |
+|--------|-------------|
+| `/updatecheck` | Runs exactly one update check including the swap, without window or restart. Exit code: 0 = up to date, 10 = updated, 20 = check failed, 30 = no write access, 40 = hash wrong or missing |
+| `/selftest` | Checks the internal logic offline with dummy data; results in `%TEMP%\loginpilot-selftest.txt`, exit code = number of failures |
+
+For local tests, the environment variable `LOGINPILOT_UPDATE_URL` can point to a test server. It is only honoured if it starts with `http://localhost:` or `http://127.0.0.1:`; any other value is ignored and logged.
+
+---
+
+## Log File
+
+LoginPilot writes `loginpilot.log` next to the EXE. If that folder is not writable, it uses `%LOCALAPPDATA%\LoginPilot\loginpilot.log`.
+
+- Line format: `YYYY-MM-DD HH:MM:SS [Area] Text`
+- Logged: program start, every step of a connection attempt (VPN profile check, VPN start, tunnel checks, RDP start, cancel/timeout), resume and network changes, every update step including error messages
+- Never logged: PINs, passwords, contents of `.ovpn` files
+- Above 300 KB the file is renamed to `loginpilot.log.1` (one generation is kept)
+- Open it via the tray menu entry **Protokoll öffnen**
 
 ---
 
@@ -127,7 +153,9 @@ LoginPilot.cs                      ← Source code
 loginpilot_config.xml              ← Config (created on first run, not in repo)
 loginpilot_icon.ico                ← Tray icon (optional)
 logo.png                           ← Custom logo shown in main window (optional)
-version.txt                        ← Current version number (e.g. 3.2)
+LoginPilot.exe.sha256              ← SHA-256 of the EXE (checked by the auto-update)
+loginpilot.log                     ← Log file (created at runtime, not in repo)
+version.txt                        ← Current version number (e.g. 3.5)
 ```
 
 ---
